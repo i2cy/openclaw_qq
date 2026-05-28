@@ -12,11 +12,10 @@ import {
     type ChannelAccountSnapshot,
     type ChannelSetupInput,
     type OpenClawConfig,
-    buildChannelConfigSchema,
     type ReplyPayload,
-    applyAccountNameToChannelSection,
-    migrateBaseNameToDefaultAccount,
 } from "openclaw/plugin-sdk";
+import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
+import { applyAccountNameToChannelSection, migrateBaseNameToDefaultAccount } from "openclaw/plugin-sdk/setup";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
