@@ -388,7 +388,15 @@ export class OneBotClient extends EventEmitter {
             if (resp.status === "ok") {
               resolve(resp.data);
             } else {
-              reject(new Error(resp.msg || "API request failed"));
+              // OneBot v11 (NapCat) puts the human-readable reason in
+              // `message`/`wording`, NOT `msg` — read all three so real
+              // failures ("识别URL失败" etc.) stop showing as "API request failed".
+              const reason =
+                (typeof resp.message === "string" && resp.message.trim()) ||
+                (typeof resp.wording === "string" && resp.wording.trim()) ||
+                (typeof resp.msg === "string" && resp.msg.trim()) ||
+                "API request failed";
+              reject(new Error(reason));
             }
           }
         } catch (err) {
@@ -485,7 +493,12 @@ export class OneBotClient extends EventEmitter {
         throw new Error(payload?.msg || payload?.message || `HTTP ${response.status}`);
       }
       if (payload?.status && payload.status !== "ok") {
-        throw new Error(payload?.msg || payload?.message || "API request failed");
+        const reason =
+          (typeof payload?.message === "string" && payload.message.trim()) ||
+          (typeof payload?.wording === "string" && payload.wording.trim()) ||
+          (typeof payload?.msg === "string" && payload.msg.trim()) ||
+          "API request failed";
+        throw new Error(reason);
       }
       return payload?.data ?? payload;
     } finally {

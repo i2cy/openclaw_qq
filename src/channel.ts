@@ -2504,12 +2504,11 @@ function toLocalPathIfAny(value: string, workspaceDir?: string): string | null {
             return null;
         }
     }
-    if (
-        value.startsWith("/") ||
-        value.startsWith("./") ||
-        value.startsWith("../") ||
-        /^[A-Za-z]:[\\/]/.test(value)
-    ) {
+    // A real URL (http/https/other scheme with ://) is NOT a local path.
+    // Everything else — absolute paths, ./ ../ and BARE relative paths like
+    // "tmp/zihua/zihua.jpg" (qq_send.sh style) — is treated as a local file
+    // so NapCat never sees a raw relative path ("识别URL失败").
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) {
         return path.isAbsolute(value) ? value : path.resolve(workspaceDir || process.cwd(), value);
     }
     return null;
@@ -2722,11 +2721,10 @@ async function resolveMediaUrl(url: string, opts?: { workspaceDir?: string; read
         }
     }
 
-    const looksLocalPath =
-        url.startsWith("/") ||
-        url.startsWith("./") ||
-        url.startsWith("../") ||
-        /^[A-Za-z]:[\\/]/.test(url);
+    // same rule as toLocalPathIfAny: anything that is NOT a scheme:// URL is a
+    // local path (absolute, relative, or bare relative) — never hand NapCat a
+    // raw relative path it cannot resolve ("识别URL失败").
+    const looksLocalPath = !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url) && !url.startsWith("file:");
     if (looksLocalPath) {
         try {
             const absolutePath = path.isAbsolute(url) ? url : path.resolve(opts?.workspaceDir || process.cwd(), url);
@@ -2986,6 +2984,7 @@ async function sendQQMediaMessage(params: {
     const mediaAck = await sendOneBotMessageWithAck(params.client, params.to, mediaMessage);
     if (!mediaAck.ok) {
         const primaryError = mediaAck.error || "unknown";
+        console.warn(`[QQ] media send failed url=${mediaUrl} kind=${mediaKind} err=${primaryError}`);
         const errorClass = classifyMediaError(primaryError);
         const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
         if (uploadAck.ok) {
