@@ -30,7 +30,7 @@
 ## D. 并发与打断
 
 - `queueDebounceMs`：同会话消息防抖合并窗口（默认 `0`，关闭）。
-- `interruptOnNewMessage`：新消息是否打断旧回复（默认关闭）。
+- `interruptOnNewMessage`：同会话新消息到达时的处理模式，取值 `off` / `abort` / `steer`（默认 `off`）。`abort`=中断上一轮回复并优先处理最新请求；`steer`=类似 opencode 的 steer，新消息排入队列，在当前这一轮工具调用完成后注入队列中的所有消息，让模型带着新指令继续当前任务。旧值 `true` 等价 `abort`，`false` 等价 `off`。
 
 ## E. 上下文增强
 
@@ -88,7 +88,7 @@
       "fastFailErrors": [],
       "queueDebounceMs": 0,
       "injectGatewayMeta": false,
-      "interruptOnNewMessage": false,
+      "interruptOnNewMessage": "off",
       "allowBareGroupCommands": false,
       "blockStreaming": true,
       "blockStreamingBreak": "message_end",
@@ -106,7 +106,7 @@
 - 过程句会按普通消息发送，不需要为了短 commentary 额外走转发。
 - `final_answer` 超过 `300` 字时，默认自动改用 QQ 合并转发。
 - 默认不会把同一轮长回复继续按节点长度拆开；`forwardNodeCharLimit=0` 就是“不拆节点”。
-- 默认不因同会话新消息而打断当前任务；只有把 `interruptOnNewMessage` 显式设为 `true` 才会启用。
+- 默认不因同会话新消息而打断当前任务；`interruptOnNewMessage` 设为 `abort` 会中断旧回复，设为 `steer` 会把新消息排队注入当前任务（工具调用完成后生效）。
 - 默认不允许群聊裸 slash 指令直接触发；请用 `椰子 /model` 这类“唤醒词 + 指令”形式。
 - 本地 `/model` 默认不主动探测 provider `/models` 全量目录；只在你显式开启 `enableDynamicModelCatalog=true` 时才做动态聚合。
 - 默认会把识别到的入站图片缓存到本地 `MediaPaths`；如果你只想保留 URL 提示，可把 `cacheInboundImagesToLocal` 设为 `false`。
@@ -119,7 +119,7 @@
 {
   "channels": {
     "qq": {
-      "interruptOnNewMessage": true,
+      "interruptOnNewMessage": "abort",
       "allowBareGroupCommands": true,
       "enableDynamicModelCatalog": true,
       "blockStreamingBreak": "text_end",

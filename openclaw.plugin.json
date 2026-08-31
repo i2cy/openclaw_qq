@@ -283,9 +283,14 @@
             "type": "boolean"
           },
           "interruptOnNewMessage": {
-            "description": "同会话新消息到达时，是否中断上一轮回复并优先处理最新请求。默认关闭。",
-            "default": false,
-            "type": "boolean"
+            "description": "同会话新消息到达时的处理模式：off=不干预（默认，新消息排队等本轮结束后再处理）；abort=中断上一轮回复并优先处理最新请求；steer=类似 opencode 的 steer，新消息放入队列，在当前这一轮工具调用完成后注入队列中所有消息，让模型带着新指令继续当前任务。旧值 true 等价 abort，false 等价 off。",
+            "default": "off",
+            "type": "string",
+            "enum": [
+              "off",
+              "abort",
+              "steer"
+            ]
           },
           "forwardLongReplyThreshold": {
             "description": "final_answer 长回复自动转为 QQ 合并转发的阈值（字符数）。默认 300；commentary 仍按普通消息发送。",

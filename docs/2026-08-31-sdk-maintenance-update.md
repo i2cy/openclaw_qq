@@ -22,6 +22,13 @@
 - 之前：新消息到达后只停止**投递**旧回复，在途的模型请求仍会跑完（慢模型下表现为"打断无效"）。
 - 现在：每次分发创建 `AbortController`，`isStale()` 变为 `true` 时立即 `abort()`，并通过 `replyOptions.abortSignal` 传入 dispatcher —— 在途模型请求被真正取消，新请求立刻接手。
 
+### 3.5 interruptOnNewMessage 新增 steer 模式（opencode 风格）
+
+- 取值升级为三态：`"off"`（默认）/ `"abort"` / `"steer"`（旧布尔值 `true`/`false` 分别等价 `"abort"`/`"off"`，升级时请迁移配置）。
+- `"steer"` 模式下，处理中新到达的消息会通过 `enqueueNextTurnInjection`（会话持久化的 next-turn 注入）排队：不中断当前 run，当前这一轮工具调用完成后，注入队列中的全部消息会被模型在下一轮 prompt 构建时吸收，带着新指令继续同一任务 —— 与 opencode 的 steer 行为一致。
+- 多条 steer 消息会自然合并（prompt 构建时一次性 drain 该会话的全部待注入项）。
+- 若注入通道不可用（会话未就绪等），自动回退到常规队列，消息不会丢。
+
 ### 4. WebUI 配置表单修复
 
 - 旧版 manifest 缺少 `channelConfigs.qq`，dashboard 拿不到通道配置 schema，显示 "Unsupported type: . Use Raw mode" 的占位控件，无法可视化调节。

@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { qqChannel } from "./src/channel.js";
-import { setQQRuntime } from "./src/runtime.js";
+import { setQQRuntime, setQQApi } from "./src/runtime.js";
 
 const plugin = {
   id: "qq",
@@ -10,6 +10,7 @@ const plugin = {
   configSchema: emptyPluginConfigSchema(),
   register(api: OpenClawPluginApi) {
     setQQRuntime(api.runtime);
+    setQQApi(api);
     api.registerChannel({ plugin: qqChannel });
   },
 };

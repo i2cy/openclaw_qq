@@ -44,6 +44,16 @@ const BooleanInputSchema = (defaultValue: boolean) => z.preprocess((value) => {
   return value;
 }, z.boolean().optional().default(defaultValue));
 
+const InterruptModeSchema = z.preprocess((value) => {
+    if (value === true) return "abort";
+    if (value === false || value === undefined || value === null || value === "") return "off";
+    const normalized = normalizeLooseString(value)?.toLowerCase().trim();
+    if (normalized === "abort" || normalized === "steer" || normalized === "off") return normalized;
+    if (["true", "1", "yes", "y", "on"].includes(normalized)) return "abort";
+    if (["false", "0", "no", "n", "off"].includes(normalized)) return "off";
+    return "off";
+}, z.enum(["off", "abort", "steer"]).optional().default("off"));
+
 const KeywordTriggersSchema = z.preprocess((value) => {
   if (value === undefined || value === null) return "";
   if (Array.isArray(value)) {
@@ -116,7 +126,7 @@ export const QQConfigSchema = z.object({
   enableQueueNotify: BooleanInputSchema(true).describe("当消息进入防抖合并队列时，是否发送提示（由于已经是静默合并，建议设为false或保持默认）。"),
   queueDebounceMs: NumberInputSchema(0).describe("连续消息合并防抖等待时间（毫秒，默认 0=关闭；大于 0 时才会开启明显的消息合并窗口）。"),
   injectGatewayMeta: BooleanInputSchema(false).describe("是否在系统提示前注入隐藏 QQ 网关元数据（会话来源、触发方式、会话标签等）。默认关闭。"),
-  interruptOnNewMessage: BooleanInputSchema(false).describe("同会话新消息到达时，是否中断上一轮回复并优先处理最新请求。默认关闭。"),
+  interruptOnNewMessage: InterruptModeSchema.describe("同会话新消息到达时的处理模式：off=不干预（默认，新消息排队等本轮结束后再处理）；abort=中断上一轮回复并优先处理最新请求；steer=类似 opencode 的 steer，新消息放入队列，在当前这一轮工具调用完成后注入队列中所有消息，让模型带着新指令继续当前任务。旧值 true 等价 abort，false 等价 off。"),
   forwardLongReplyThreshold: NumberInputSchema(300).describe("final_answer 长回复自动转为 QQ 合并转发的阈值（字符数）。默认 300；commentary 仍按普通消息发送。"),
   forwardNodeCharLimit: NumberInputSchema(0).describe("启用长回复合并转发时，每个转发节点的最大字符数。默认 0，表示不按长度拆节点；同一轮回复的多条 assistant message 会尽量合并进一个转发。"),
   forwardNodeName: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("OpenClaw")).describe("启用长回复合并转发时，节点显示昵称。默认 OpenClaw。"),

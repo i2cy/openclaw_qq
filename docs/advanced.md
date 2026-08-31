@@ -23,7 +23,7 @@
 ## 最近更新（2026-03）
 
 - 本轮重点是 QQ 插件默认行为调整，不改 OpenClaw core 的主逻辑；旧体验仍可通过配置项手动恢复。
-- 默认关闭 `interruptOnNewMessage`，并修正为“只有显式配置 `true` 才启用新消息打断”。
+- `interruptOnNewMessage` 升级为三态：`off`（默认）/ `abort`（中断旧回复，旧 `true` 等价）/ `steer`（新消息排队，在当前这轮工具调用完成后注入，类似 opencode 的 steer）。
 - 默认启用 `blockStreaming=true` 与 `blockStreamingBreak=message_end`，让 commentary / final 按完整 assistant message 落地。
 - 默认 `forwardLongReplyThreshold=300`，长 `final_answer` 超过阈值时改走 QQ 合并转发；commentary 仍按普通消息发送。
 - 默认 `forwardNodeCharLimit=0`，合并转发时不再按长度拆节点，同一轮长回复尽量合并成一个转发。
@@ -185,7 +185,7 @@ openclaw setup qq
       "maxMessageLength": 4000,
       "queueDebounceMs": 0,
       "injectGatewayMeta": false,
-      "interruptOnNewMessage": false,
+      "interruptOnNewMessage": "off",
       "blockStreaming": true,
       "blockStreamingBreak": "message_end",
       "forwardLongReplyThreshold": 300,

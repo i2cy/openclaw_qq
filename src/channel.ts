@@ -24,7 +24,7 @@ import {
 } from "openclaw/plugin-sdk/channel-inbound";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
-import { getQQRuntime } from "./runtime.js";
+import { getQQRuntime, getQQApi } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
@@ -95,6 +95,13 @@ type QQSetupInput = ChannelSetupInput & {
 
 const sessionQueues = new Map<string, SessionQueue>();
 
+type InterruptMode = "off" | "abort" | "steer";
+const resolveInterruptMode = (value: unknown): InterruptMode => {
+    if (value === "abort" || value === "steer" || value === "off") return value;
+    if (value === true) return "abort";
+    return "off";
+};
+
 // per-message identity/clock for merged group messages
 const formatQQClock = (ts?: number): string => {
     if (!ts || !Number.isFinite(ts)) return "--:--:--";
@@ -108,11 +115,17 @@ const formatQQSender = (p: PendingQQMsg, index: number): string => {
     const id = c.SenderId !== undefined && c.SenderId !== "" ? `(${c.SenderId})` : "";
     return `${formatQQClock(c.Timestamp)} ${name}${id}`;
 };
+const formatSteerMessage = (p: PendingQQMsg, index: number): string => {
+    const c = p.ctxPayload ?? {};
+    const text = typeof c.Body === "string" && c.Body.trim() ? c.Body : String(c.RawBody ?? "");
+    return `[${formatQQSender(p, index)}]: ${text}`;
+};
 
 async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessageFn: (msg: string) => void) {
     const q = sessionQueues.get(sessionKey);
     if (!q || q.isProcessing || q.pendingPayloads.length === 0) return;
-    const interruptOnNewMessage = config.interruptOnNewMessage === true;
+    const interruptMode = resolveInterruptMode(config.interruptOnNewMessage);
+    const abortOnNewMessage = interruptMode === "abort";
 
     q.isProcessing = true;
     const payloads = q.pendingPayloads;
@@ -163,7 +176,7 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
                     const state = sessionQueues.get(sessionKey);
                     if (!state) return true;
                     if (state.activeEpoch !== runEpoch) return true;
-                    return interruptOnNewMessage && state.latestEpoch !== runEpoch;
+                    return abortOnNewMessage && state.latestEpoch !== runEpoch;
                 },
             }),
             log: (ev: any) => {
@@ -184,18 +197,52 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
     }
 }
 
-function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, config: QQConfig, sendMessageFn: (msg: string) => void) {
+async function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, config: QQConfig, sendMessageFn: (msg: string) => void) {
     let q = sessionQueues.get(sessionKey);
     if (!q) {
         q = { pendingPayloads: [], timer: null, isProcessing: false, latestEpoch: 0, activeEpoch: 0 };
         sessionQueues.set(sessionKey, q);
     }
 
+    const interruptMode = resolveInterruptMode(config.interruptOnNewMessage);
+
+    // steer: while a run is in flight, queue the message as a next-turn
+    // injection (opencode-style). The running turn picks it up at its next
+    // prompt build (right after the current tool-call round completes), so
+    // the model continues the SAME task with the new instruction. We do NOT
+    // bump the epoch (no abort) and do NOT add to pendingPayloads (no
+    // double-processing once the injection is drained).
+    if (interruptMode === "steer" && q.isProcessing && q.activeEpoch > 0) {
+        const text = formatSteerMessage(msg, 0);
+        try {
+            const result = await getQQApi().enqueueNextTurnInjection({
+                sessionKey,
+                text,
+                placement: "prepend_context",
+                ...(typeof msg.ctxPayload?.MessageSid === "string" ? { idempotencyKey: `qq-steer-${msg.ctxPayload.MessageSid}` } : {}),
+                ttlMs: 30 * 60 * 1000,
+            });
+            if (result?.enqueued) {
+                if (config.enableQueueNotify !== false) {
+                    sendMessageFn("[OpenClawQQ] 收到新消息，已排队，将在当前这轮完成后并入处理。");
+                }
+                console.log(`[QQ] steer enqueued sess=${sessionKey} id=${result.id} text="${text.slice(0, 60)}"`);
+                return;
+            }
+            console.warn(`[QQ] steer enqueue rejected (enqueued=${String(result?.enqueued)}), falling back to queue`);
+        } catch (err) {
+            console.error(`[QQ] steer enqueue failed, falling back to queue:`, err);
+        }
+        if (config.enableQueueNotify !== false) {
+            sendMessageFn("[OpenClawQQ] 新消息已进入排队，将在当前这轮结束后处理。");
+        }
+    }
+
     q.latestEpoch += 1;
     msg.runEpoch = q.latestEpoch;
     q.pendingPayloads.push(msg);
 
-    if (config.interruptOnNewMessage === true && q.isProcessing && q.activeEpoch > 0) {
+    if (interruptMode === "abort" && q.isProcessing && q.activeEpoch > 0) {
         if (config.enableQueueNotify !== false) {
             sendMessageFn("[OpenClawQQ] 检测到新消息，正在中断上一轮回复并切换到新请求。");
         }
@@ -4680,7 +4727,7 @@ ${current}
                         }
                     };
 
-                    enqueueQQMessageForDispatch(
+                    await enqueueQQMessageForDispatch(
                         route.sessionKey,
                         { ctxPayload, storePath, executeDispatch, runEpoch: 0 },
                         config,
