@@ -20,6 +20,14 @@
 > **官方交流论坛（唯一）：** https://aiya.de5.net/c/25-category/25  
 > 问题反馈、配置经验、更新公告统一在论坛沉淀，便于检索和追踪。
 
+## 最近更新（2026-08）
+
+- 新增专题说明：[2026-08-31 内核 API 迁移与维护更新](./docs/2026-08-31-sdk-maintenance-update.md)。
+- 入站上下文改用官方 `buildChannelInboundEventContext`（facts 式），会话记录迁移到 `runPreparedInboundReply` 内核路径，`/newsession`、`/end` 改用 `resolveInboundSessionEnvelopeContext` —— 插件源码不再直接调用任何 deprecated 的通道运行时接口。
+- `interruptOnNewMessage` 升级为"真中断"：新消息到达时通过 `abortSignal` 直接取消在途模型请求，不再等旧请求跑完，慢模型下打断立刻生效。
+- `queueDebounceMs` 合并多条连续消息时，每条消息现在带独立的时钟、昵称与 QQ 号（`[HH:MM:SS 昵称(QQ号)]`），不再是匿名的 `[消息 N]`。
+- WebUI 配置表单修复：manifest 补齐 `channelConfigs.qq`（56 个配置项 + 13 项中文标签），dashboard 可直接可视化调节，不再显示 "Unsupported type" 占位控件。
+
 ## 最近更新（2026-04）
 
 - 新增专题说明：[2026-04-30 原生文件 / 媒体收发更新](./docs/2026-04-30-native-media-file-update.md)。
