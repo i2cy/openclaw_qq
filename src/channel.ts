@@ -17,6 +17,11 @@ import {
 import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import { applyAccountNameToChannelSection, migrateBaseNameToDefaultAccount } from "openclaw/plugin-sdk/setup";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
+import {
+    buildChannelInboundEventContext,
+    resolveInboundSessionEnvelopeContext,
+    runPreparedInboundReply,
+} from "openclaw/plugin-sdk/channel-inbound";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime } from "./runtime.js";
@@ -30,6 +35,7 @@ export type ResolvedQQAccount = ChannelAccountSnapshot & {
 interface PendingQQMsg {
     ctxPayload: any;
     runEpoch: number;
+    storePath: string;
     executeDispatch: (mergedCtx: any, runState: { isStale: () => boolean }) => Promise<void>;
 }
 
@@ -89,6 +95,20 @@ type QQSetupInput = ChannelSetupInput & {
 
 const sessionQueues = new Map<string, SessionQueue>();
 
+// per-message identity/clock for merged group messages
+const formatQQClock = (ts?: number): string => {
+    if (!ts || !Number.isFinite(ts)) return "--:--:--";
+    const d = new Date(ts);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+};
+const formatQQSender = (p: PendingQQMsg, index: number): string => {
+    const c = p.ctxPayload ?? {};
+    const name = typeof c.SenderName === "string" && c.SenderName.trim() ? c.SenderName : `用户${index + 1}`;
+    const id = c.SenderId !== undefined && c.SenderId !== "" ? `(${c.SenderId})` : "";
+    return `${formatQQClock(c.Timestamp)} ${name}${id}`;
+};
+
 async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessageFn: (msg: string) => void) {
     const q = sessionQueues.get(sessionKey);
     if (!q || q.isProcessing || q.pendingPayloads.length === 0) return;
@@ -106,7 +126,7 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
                 if (payloads.some(p => typeof p.ctxPayload[key] === "string")) {
                     mergedCtx[key] = payloads.map((p, i) => {
                         const val = p.ctxPayload[key] || p.ctxPayload.Body || p.ctxPayload.RawBody || "";
-                        return `[消息 ${i + 1}]: ${val}`;
+                        return `[${formatQQSender(p, i)}]: ${val}`;
                     }).join("\n\n");
                 }
             };
@@ -127,12 +147,29 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
             }
         }
 
-        await payloads[0].executeDispatch(mergedCtx, {
-            isStale: () => {
-                const state = sessionQueues.get(sessionKey);
-                if (!state) return true;
-                if (state.activeEpoch !== runEpoch) return true;
-                return interruptOnNewMessage && state.latestEpoch !== runEpoch;
+        const qqRuntime = getQQRuntime();
+        const channelSurface = qqRuntime.channel;
+        await runPreparedInboundReply({
+            channel: "qq",
+            accountId: mergedCtx.AccountId,
+            routeSessionKey: mergedCtx.SessionKey ?? sessionKey,
+            storePath: payloads[0].storePath,
+            ctxPayload: mergedCtx,
+            recordInboundSession: channelSurface.session.recordInboundSession,
+            record: { createIfMissing: true },
+            onPreDispatchFailure: (err) => console.error("[QQ] inbound session record failed:", err),
+            runDispatch: () => payloads[0].executeDispatch(mergedCtx, {
+                isStale: () => {
+                    const state = sessionQueues.get(sessionKey);
+                    if (!state) return true;
+                    if (state.activeEpoch !== runEpoch) return true;
+                    return interruptOnNewMessage && state.latestEpoch !== runEpoch;
+                },
+            }),
+            log: (ev: any) => {
+                if (config.debugLayerTrace) {
+                    console.log(`[QQLayerTrace] turn stage=${ev?.stage} event=${ev?.event} admission=${ev?.admission ?? "-"} reason=${ev?.reason ?? "-"}`);
+                }
             },
         });
 
@@ -3648,7 +3685,11 @@ ${current}
                                     id: tempFromId,
                                 },
                             });
-                            const storePathForEnd = runtimeForEnd.channel.session.resolveStorePath(cfg.session?.store, { agentId: routeForEnd.agentId });
+                            const storePathForEnd = resolveInboundSessionEnvelopeContext({
+                                cfg,
+                                agentId: routeForEnd.agentId,
+                                sessionKey: routeForEnd.sessionKey,
+                            }).storePath;
                             await resetSessionByKey(storePathForEnd, routeForEnd.sessionKey);
                             await setTempSessionSlot(threadSessionKey, null);
                             const msg = `[OpenClawd QQ]
@@ -3715,7 +3756,11 @@ ${current}
                                     id: fromIdForReset,
                                 },
                             });
-                            const storePath = runtimeForReset.channel.session.resolveStorePath(cfg.session?.store, { agentId: routeForReset.agentId });
+                            const storePath = resolveInboundSessionEnvelopeContext({
+                                cfg,
+                                agentId: routeForReset.agentId,
+                                sessionKey: routeForReset.sessionKey,
+                            }).storePath;
                             const resetOk = await resetSessionByKey(storePath, routeForReset.sessionKey);
                             const notice = resetOk
                                 ? "✅ 当前会话已重置。请继续发送你的问题。"
@@ -4324,16 +4369,54 @@ ${current}
 
                     const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
-                    const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-                        Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
-                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel, ThreadLabel: sessionLabel,
-                        SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
-                        Surface: "qq",
-                        ...(event.message_id !== undefined && { MessageSid: String(event.message_id) }),
-                        OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
-                        ...inboundMediaPayload,
-                        ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
+                    const sessionEnvelope = resolveInboundSessionEnvelopeContext({
+                        cfg,
+                        agentId: route.agentId,
+                        sessionKey: route.sessionKey,
                     });
+                    const storePath = sessionEnvelope.storePath;
+                    const ctxPayload = buildChannelInboundEventContext({
+                        channel: "qq",
+                        accountId: route.accountId,
+                        provider: "qq",
+                        surface: "qq",
+                        messageId: event.message_id !== undefined ? String(event.message_id) : undefined,
+                        timestamp: event.time * 1000,
+                        from: fromId,
+                        sender: {
+                            id: String(userId),
+                            name: event.sender?.nickname || "Unknown",
+                            displayLabel: event.sender?.card || event.sender?.nickname || "Unknown",
+                        },
+                        conversation: {
+                            kind: isGroup ? "group" : (isGuild ? "channel" : "direct"),
+                            id: fromId,
+                            label: conversationLabel,
+                        },
+                        route: {
+                            agentId: route.agentId,
+                            accountId: route.accountId,
+                            routeSessionKey: route.sessionKey,
+                        },
+                        reply: {
+                            to: "qq:bot",
+                            originatingTo: deliveryTo,
+                            ...(replyMsgId && { replyToId: String(replyMsgId) }),
+                        },
+                        message: {
+                            rawBody: text,
+                            body: bodyWithReply,
+                            bodyForAgent: bodyWithReply,
+                        },
+                        access: {
+                            commands: { authorized: commandAuthorized, authorizers: [] },
+                        },
+                        extra: {
+                            ThreadLabel: sessionLabel,
+                            ...inboundMediaPayload,
+                            ...(replyMsgId && { ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
+                        },
+                    }) as any;
                     if (config.debugLayerTrace) {
                         const ctxMediaUrls = Array.isArray(ctxPayload.MediaUrls)
                             ? ctxPayload.MediaUrls
@@ -4346,15 +4429,17 @@ ${current}
                         );
                     }
 
-                    await runtime.channel.session.recordInboundSession({
-                        storePath: runtime.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId }),
-                        sessionKey: ctxPayload.SessionKey!, ctx: ctxPayload,
-                        updateLastRoute: undefined,
-                        onRecordError: (err) => console.error("QQ Session Error:", err)
-                    });
-
                     const executeDispatch = async (mergedCtx: any, runState: { isStale: () => boolean }) => {
-                        currentRunState = runState;
+                        // real interrupt: abort the in-flight model call when a newer
+                        // message supersedes this run (was "check-only" before, which
+                        // made interruptOnNewMessage feel unresponsive on slow models)
+                        const abortController = new AbortController();
+                        const stale = () => {
+                            const s = runState.isStale();
+                            if (s) abortController.abort();
+                            return s;
+                        };
+                        currentRunState = { isStale: stale };
                         let processingDelayTimer: ReturnType<typeof setTimeout> | null = null;
                         let typingCardActivated = false;
                         const taskKey = buildTaskKey(account.accountId, isGroup, isGuild, groupId, guildId, channelId, userId);
@@ -4496,7 +4581,9 @@ ${current}
                                                         console.error(`[QQ] buffered dispatch ${deliveryInfo.kind} failed: ${String(err)}`);
                                                     },
                                                 },
-                                                replyOptions: {},
+                                                replyOptions: {
+                                                    abortSignal: abortController.signal,
+                                                },
                                             });
                                             if (!runState.isStale()) {
                                                 console.log(`[QQ] dispatch result queuedFinal=${String(Boolean(dispatchResult?.queuedFinal))} counts=${JSON.stringify(dispatchResult?.counts || {})} session=${route.sessionKey}`);
@@ -4580,6 +4667,7 @@ ${current}
                             resetBufferedUnknownTexts();
                             resetBufferedFinalTexts();
                             currentRunState = null;
+                            abortController.abort();
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
                             if (typingCardActivated && isGroup) {
@@ -4590,7 +4678,7 @@ ${current}
 
                     enqueueQQMessageForDispatch(
                         route.sessionKey,
-                        { ctxPayload, executeDispatch, runEpoch: 0 },
+                        { ctxPayload, storePath, executeDispatch, runEpoch: 0 },
                         config,
                         (msg: string) => {
                             if (isGroup) client.sendGroupMsg(groupId, msg);
