@@ -35,7 +35,8 @@
 ## E. 上下文增强
 
 - `historyLimit`：注入群历史条数（推荐默认 0）。
-- `enrichReplyForwardContext`：是否递归解析 reply/forward。
+- `enrichReplyForwardContext`：是否递归解析 reply/forward 并注入 `<context_layers>` 上下文块（默认关闭；不显式开启则完全不注入，避免额外 token 占用。需要引用 / 合并转发线索时手动开启）。
+- `includeCurrentOutline`：层级上下文里是否额外回显当前消息概要（默认关闭；当前消息本身就是模型输入，回显会占用双倍 token）。
 - `cacheInboundImagesToLocal`：是否把当前消息及 reply / forward 里的图片缓存到本地 `MediaPaths`。
 - `maxReplyLayers` / `maxForwardLayers`：递归深度上限。
 - `maxTotalContextChars`：注入字符预算上限。

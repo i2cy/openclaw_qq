@@ -26,6 +26,8 @@
 - 入站上下文改用官方 `buildChannelInboundEventContext`（facts 式），会话记录迁移到 `runPreparedInboundReply` 内核路径，`/newsession`、`/end` 改用 `resolveInboundSessionEnvelopeContext` —— 插件源码不再直接调用任何 deprecated 的通道运行时接口。
 - `interruptOnNewMessage` 升级为"真中断"：新消息到达时通过 `abortSignal` 直接取消在途模型请求，不再等旧请求跑完，慢模型下打断立刻生效。
 - `queueDebounceMs` 合并多条连续消息时，每条消息现在带独立的时钟、昵称与 QQ 号（`[HH:MM:SS 昵称(QQ号)]`），不再是匿名的 `[消息 N]`。
+- 系统上下文块不再混入用户可见的 `Body`：`<context_layers>` / `<history>` / `<attachments>` 等只进 `BodyForAgent`（模型输入），session 与 dashboard 里显示的是干净的用户原文。
+- `enrichReplyForwardContext` 默认改为关闭：未显式开启时完全不注入 `<context_layers>` 块（避免占额外 token）；同时 `includeCurrentOutline` 默认改为关闭，不再把当前消息概要回显一遍（当前消息本身就是模型输入，回显 = 双倍 token）。
 - WebUI 配置表单修复：manifest 补齐 `channelConfigs.qq`（56 个配置项 + 13 项中文标签），dashboard 可直接可视化调节，不再显示 "Unsupported type" 占位控件。
 
 ## 最近更新（2026-04）

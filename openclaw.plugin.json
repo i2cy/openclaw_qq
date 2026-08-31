@@ -204,8 +204,8 @@
             "type": "boolean"
           },
           "enrichReplyForwardContext": {
-            "description": "是否递归解析 reply/forward 并注入多层上下文。默认开启。",
-            "default": true,
+            "description": "是否递归解析 reply/forward 并注入多层上下文。默认关闭（不显式开启则完全不注入 `<context_layers>` 块，避免上下文占用额外 token）；需要引用/合并转发线索时再手动开启。",
+            "default": false,
             "type": "boolean"
           },
           "cacheInboundImagesToLocal": {
@@ -258,8 +258,8 @@
             "type": "boolean"
           },
           "includeCurrentOutline": {
-            "description": "是否注入当前消息概要层。",
-            "default": true,
+            "description": "是否在层级上下文里额外回显当前消息概要（默认关闭：当前消息本身就是模型输入，回显会占用双倍 token）。",
+            "default": false,
             "type": "boolean"
           },
           "rateLimitMs": {

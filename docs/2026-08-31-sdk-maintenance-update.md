@@ -32,7 +32,16 @@
 
 - `queueDebounceMs > 0` 触发连续消息合并时，每条消息由无身份信息的 `[消息 N]:` 改为 `[HH:MM:SS 昵称(QQ号)]:` 前缀，来源与时间一目了然。
 
+### 6. 系统上下文与用户消息分离（不再泄漏、不再双倍 token）
+
+- 之前 `<context_layers>` / `<history>` / `<attachments>` 等系统上下文块被拼进 `Body`，会出现在 session 记录与 WebUI dashboard 的消息视图里。
+- 现在 `Body` 只保留用户原文（`cleanCQCodes(text)` + 回复引用后缀），全部系统上下文块只进 `BodyForAgent`（模型输入），肉眼可见的消息面不再出现任何标签。
+- `enrichReplyForwardContext` 默认改为 `false`：未显式开启时完全不注入 `<context_layers>` 块。
+- `includeCurrentOutline` 默认改为 `false`：不再把当前消息概要回显进上下文（当前消息本身就是模型输入，回显等于双倍 token）。
+- 需要引用 / 合并转发线索时，显式开启 `enrichReplyForwardContext=true` 即可。
+
 ## 影响范围
 
 - 无需改动任何配置项即可升级；`interruptOnNewMessage` 语义增强无需额外配置。
+- 默认行为变化：`enrichReplyForwardContext` 与 `includeCurrentOutline` 默认关闭，回复 / 转发上下文注入改为按需开启。
 - 建议升级后重启网关，并用一条真实 QQ 消息验证回复正常。

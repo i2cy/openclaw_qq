@@ -4280,7 +4280,11 @@ ${current}
                     }
 
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
-                    let bodyWithReply = cleanCQCodes(text) + replySuffix;
+                    // Body = what the user actually said (clean, session/dashboard-visible).
+                    // agentBody = Body + system context blocks (model-only; never leaks
+                    // <context_layers>/<history>/<system> into visible messages).
+                    const cleanBody = cleanCQCodes(text) + replySuffix;
+                    let agentBody = cleanBody;
                     let systemBlock = "";
                     if (config.injectGatewayMeta !== false) {
                         systemBlock += buildQQHiddenMetaBlock({
@@ -4335,7 +4339,7 @@ ${current}
                         }
                         systemBlock += `</attachments>\n\n`;
                     }
-                    bodyWithReply = systemBlock + bodyWithReply;
+                    agentBody = systemBlock + cleanBody;
 
                     const inboundMediaUrls = Array.from(new Set([
                         ...extractImageUrls(event.message),
@@ -4405,8 +4409,8 @@ ${current}
                         },
                         message: {
                             rawBody: text,
-                            body: bodyWithReply,
-                            bodyForAgent: bodyWithReply,
+                            body: cleanBody,
+                            bodyForAgent: agentBody,
                         },
                         access: {
                             commands: { authorized: commandAuthorized, authorizers: [] },
