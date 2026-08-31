@@ -24,7 +24,7 @@ import {
 } from "openclaw/plugin-sdk/channel-inbound";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
-import { getQQRuntime, getQQApi } from "./runtime.js";
+import { getQQRuntime, pushSteerText, drainSteerTexts } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
@@ -45,6 +45,8 @@ interface SessionQueue {
     isProcessing: boolean;
     latestEpoch: number;
     activeEpoch: number;
+    currentAbort?: AbortController;
+    steerFallbackTimer?: ReturnType<typeof setTimeout>;
 }
 
 type OneBotImageHint = {
@@ -192,6 +194,7 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
         if (q.pendingPayloads.length > 0 && !q.timer) {
             setTimeout(() => { void drainSessionQueue(sessionKey, config, sendMessageFn); }, 0);
         } else if (q.pendingPayloads.length === 0) {
+            if (q.steerFallbackTimer) clearTimeout(q.steerFallbackTimer);
             sessionQueues.delete(sessionKey);
         }
     }
@@ -206,35 +209,43 @@ async function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg
 
     const interruptMode = resolveInterruptMode(config.interruptOnNewMessage);
 
-    // steer: while a run is in flight, queue the message as a next-turn
-    // injection (opencode-style). The running turn picks it up at its next
-    // prompt build (right after the current tool-call round completes), so
-    // the model continues the SAME task with the new instruction. We do NOT
-    // bump the epoch (no abort) and do NOT add to pendingPayloads (no
-    // double-processing once the injection is drained).
+    // steer: while a run is in flight, queue the message in the in-memory
+    // steer queue (opencode-style). The before_prompt_build hook fires at
+    // EVERY prompt build — including mid-run tool rounds — so the running
+    // turn picks the steer up at its very next model round and continues the
+    // SAME task with the new instruction. No abort (epoch untouched) and no
+    // pendingPayloads (the hook delivers it; no double-processing).
     if (interruptMode === "steer" && q.isProcessing && q.activeEpoch > 0) {
-        const text = formatSteerMessage(msg, 0);
-        try {
-            const result = await getQQApi().enqueueNextTurnInjection({
-                sessionKey,
-                text,
-                placement: "prepend_context",
-                ...(typeof msg.ctxPayload?.MessageSid === "string" ? { idempotencyKey: `qq-steer-${msg.ctxPayload.MessageSid}` } : {}),
-                ttlMs: 30 * 60 * 1000,
-            });
-            if (result?.enqueued) {
-                if (config.enableQueueNotify !== false) {
-                    sendMessageFn("[OpenClawQQ] 收到新消息，已排队，将在当前这轮完成后并入处理。");
-                }
-                console.log(`[QQ] steer enqueued sess=${sessionKey} id=${result.id} text="${text.slice(0, 60)}"`);
-                return;
+        const body = typeof msg.ctxPayload?.Body === "string" ? msg.ctxPayload.Body : String(msg.ctxPayload?.RawBody ?? "");
+        if (!body.trim()) {
+            // empty message body (image-only / notice remnants): keep normal queue
+            console.log(`[QQ] steer skipped empty text, falling back to queue`);
+            if (config.enableQueueNotify !== false) {
+                sendMessageFn("[OpenClawQQ] 新消息已进入排队，将在当前这轮结束后处理。");
             }
-            console.warn(`[QQ] steer enqueue rejected (enqueued=${String(result?.enqueued)}), falling back to queue`);
-        } catch (err) {
-            console.error(`[QQ] steer enqueue failed, falling back to queue:`, err);
-        }
-        if (config.enableQueueNotify !== false) {
-            sendMessageFn("[OpenClawQQ] 新消息已进入排队，将在当前这轮结束后处理。");
+        } else {
+            const text = formatSteerMessage(msg, 0);
+            pushSteerText(sessionKey, text);
+            if (config.enableQueueNotify !== false) {
+                sendMessageFn("[OpenClawQQ] 收到新消息，已排队，将在当前这轮的工具调用完成后并入处理。");
+            }
+            console.log(`[QQ] steer queued sess=${sessionKey} text="${text.slice(0, 60)}"`);
+            // safety net: if the prompt-injection hook never picks the steer
+            // up (gateway builds whose channel dispatches skip those hooks),
+            // convert it into a normal queued turn so the message is NEVER lost.
+            if (q.steerFallbackTimer) clearTimeout(q.steerFallbackTimer);
+            q.steerFallbackTimer = setTimeout(() => {
+                q!.steerFallbackTimer = null;
+                const pending = drainSteerTexts(sessionKey);
+                if (pending.length === 0) return;
+                q!.latestEpoch += 1;
+                msg.runEpoch = q!.latestEpoch;
+                q!.pendingPayloads.push(msg);
+                if (q!.timer) clearTimeout(q!.timer);
+                q!.timer = setTimeout(() => { q!.timer = null; void drainSessionQueue(sessionKey, config, sendMessageFn); }, 0);
+                console.log(`[QQ] steer fallback: hook never drained, queued as normal turn (${pending.length} msgs)`);
+            }, 20 * 1000);
+            return;
         }
     }
 
@@ -243,6 +254,9 @@ async function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg
     q.pendingPayloads.push(msg);
 
     if (interruptMode === "abort" && q.isProcessing && q.activeEpoch > 0) {
+        // abort the in-flight model call RIGHT NOW (not at the next stale()
+        // check, which only happens after the model call returns)
+        q.currentAbort?.abort();
         if (config.enableQueueNotify !== false) {
             sendMessageFn("[OpenClawQQ] 检测到新消息，正在中断上一轮回复并切换到新请求。");
         }
@@ -3375,6 +3389,17 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 }
             });
 
+            client.on("notice", (event) => {
+                if (isStaleGeneration()) return;
+                // Swallow OneBot notices: they are system notifications (e.g.
+                // "file received by the other side"), not user messages.
+                // Previously these fell into the message path as EMPTY text,
+                // which made the model reply "I didn't receive any text..."
+                const noticeType = (event as any)?.notice_type ?? "unknown";
+                const target = (event as any)?.group_id ? `group:${(event as any).group_id}` : (event as any)?.user_id ? `user:${(event as any).user_id}` : "-";
+                console.log(`[QQ] notice swallowed type=${noticeType} target=${target}`);
+            });
+
             client.on("message", async (event) => {
                 try {
                     if (isStaleGeneration()) return;
@@ -3408,6 +3433,16 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     }
 
                     if (event.post_type !== "message") return;
+
+                    // NapCat emits an EMPTY message event (message: [], no
+                    // segments, no raw_message) as a file-delivery receipt when
+                    // the other side receives a file the bot sent. It carries
+                    // zero user content — dropping it prevents phantom empty
+                    // turns ("I didn't receive any text in your message...").
+                    if (Array.isArray(event.message) && event.message.length === 0 && !event.raw_message) {
+                        console.log(`[QQ] dropped empty message event (file-delivery receipt?) user=${event.user_id ?? "-"} mtype=${event.message_type ?? "-"}`);
+                        return;
+                    }
 
                     // 2. Dynamic self-message filtering
                     const selfId = client.getSelfId() || event.self_id;
@@ -3501,6 +3536,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                             }
                         }
                         if (resolvedText) text = resolvedText;
+                    }
+
+                    if (!text.trim() && Array.isArray(event.message)) {
+                        console.log(`[QQ] EMPTY-MSG post=${event.post_type} mtype=${event.message_type ?? "-"} sub=${event.sub_type ?? "-"} notice=${event.notice_type ?? "-"} segs=${JSON.stringify((event.message as any[]).map((s: any) => s?.type)).slice(0, 120)} raw=${JSON.stringify(event).slice(0, 500)}`);
                     }
 
                     if (blockedUserIds.includes(userId)) return;
@@ -4482,9 +4521,15 @@ ${current}
 
                     const executeDispatch = async (mergedCtx: any, runState: { isStale: () => boolean }) => {
                         // real interrupt: abort the in-flight model call when a newer
-                        // message supersedes this run (was "check-only" before, which
-                        // made interruptOnNewMessage feel unresponsive on slow models)
+                        // message supersedes this run. Two triggers:
+                        //  1) immediate: enqueueQQMessageForDispatch calls
+                        //     q.currentAbort.abort() the moment a new message
+                        //     arrives while this run is in flight;
+                        //  2) lazy: stale() aborts if the epoch moved by the time
+                        //     the model returns (belt-and-suspenders).
                         const abortController = new AbortController();
+                        const qForAbort = sessionQueues.get(route.sessionKey);
+                        if (qForAbort) qForAbort.currentAbort = abortController;
                         const stale = () => {
                             const s = runState.isStale();
                             if (s) abortController.abort();
@@ -4719,6 +4764,8 @@ ${current}
                             resetBufferedFinalTexts();
                             currentRunState = null;
                             abortController.abort();
+                            const qFinal = sessionQueues.get(route.sessionKey);
+                            if (qFinal && qFinal.currentAbort === abortController) qFinal.currentAbort = undefined;
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
                             if (typingCardActivated && isGroup) {

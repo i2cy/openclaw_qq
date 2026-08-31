@@ -177,6 +177,12 @@ export class OneBotClient extends EventEmitter {
       this.emit("request", payload);
       return;
     }
+    if (payload.post_type === "notice") {
+      // OneBot notices (file received, group member changes, etc.) are NOT
+      // user messages — never feed them to the agent as empty text.
+      this.emit("notice", payload);
+      return;
+    }
     this.emit("message", payload);
   }
 

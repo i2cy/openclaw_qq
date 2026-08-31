@@ -26,6 +26,9 @@
 - 入站上下文改用官方 `buildChannelInboundEventContext`（facts 式），会话记录迁移到 `runPreparedInboundReply` 内核路径，`/newsession`、`/end` 改用 `resolveInboundSessionEnvelopeContext` —— 插件源码不再直接调用任何 deprecated 的通道运行时接口。
 - `interruptOnNewMessage` 升级为"真中断"：新消息到达时通过 `abortSignal` 直接取消在途模型请求，不再等旧请求跑完，慢模型下打断立刻生效。
 - `interruptOnNewMessage` 新增 **steer 模式**（类似 opencode 的 steer）：新消息排入队列，在当前这一轮工具调用完成后注入队列中的所有消息，模型带着新指令继续当前任务（配置取 `"steer"`；`"abort"` = 旧中断行为，`"off"` = 关闭；旧布尔值 `true`/`false` 分别等价 `"abort"`/`"off"`）。
+- `abort` 模式改为**即时中断**：新消息到达瞬间即取消在途模型请求（此前要等模型调用返回后才检查，等于没中断）。
+- OneBot `notice` 事件（文件被接收、群成员变动等系统通知）不再被当成用户消息；NapCat 发送文件后收到的空 `message: []` 送达回执也会被丢弃 —— 不再出现模型回复 "I didn't receive any text in your message" 的幽灵消息。
+- steer 注入通过 `before_prompt_build` 钩子实现；若网关构建不支持在通道分发中运行该钩子，20 秒后自动转为常规队列兜底，消息不会丢失。
 - `queueDebounceMs` 合并多条连续消息时，每条消息现在带独立的时钟、昵称与 QQ 号（`[HH:MM:SS 昵称(QQ号)]`），不再是匿名的 `[消息 N]`。
 - 系统上下文块不再混入用户可见的 `Body`：`<context_layers>` / `<history>` / `<attachments>` 等只进 `BodyForAgent`（模型输入），session 与 dashboard 里显示的是干净的用户原文。
 - `enrichReplyForwardContext` 默认改为关闭：未显式开启时完全不注入 `<context_layers>` 块（避免占额外 token）；同时 `includeCurrentOutline` 默认改为关闭，不再把当前消息概要回显一遍（当前消息本身就是模型输入，回显 = 双倍 token）。

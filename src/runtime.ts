@@ -24,3 +24,22 @@ export function getQQApi(): OpenClawPluginApi {
     }
     return pluginApi;
 }
+
+// ---- steer queue (opencode-style): pending per-session steering messages ----
+// consumed by the before_prompt_build hook, which fires at EVERY prompt build
+// (including mid-run tool rounds), so a queued steer lands in the very next
+// prompt the model sees.
+const steerQueue = new Map<string, string[]>();
+
+export function pushSteerText(sessionKey: string, text: string) {
+    const q = steerQueue.get(sessionKey) ?? [];
+    q.push(text);
+    steerQueue.set(sessionKey, q);
+}
+
+export function drainSteerTexts(sessionKey: string): string[] {
+    const q = steerQueue.get(sessionKey);
+    if (!q || q.length === 0) return [];
+    steerQueue.delete(sessionKey);
+    return q;
+}
