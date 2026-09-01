@@ -26,6 +26,7 @@ import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime, pushSteerText, drainSteerTexts } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
+import { recoverStaleSessionLocks, hasStaleSessionLock } from "./session-lock-recovery.js";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
     config: QQConfig;
@@ -4529,9 +4530,13 @@ ${current}
                         const abortController = new AbortController();
                         const qForAbort = sessionQueues.get(route.sessionKey);
                         if (qForAbort) qForAbort.currentAbort = abortController;
+                        let wasAborted = false;
                         const stale = () => {
                             const s = runState.isStale();
-                            if (s) abortController.abort();
+                            if (s) {
+                                wasAborted = true;
+                                abortController.abort();
+                            }
                             return s;
                         };
                         currentRunState = { isStale: stale };
@@ -4700,6 +4705,18 @@ ${current}
                                         }
 
                                         if (globalDispatchError) {
+                                            const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
+                                            // openclaw's session write lock can leak when an aborted run's cleanup
+                                            // stalls (abort settle timeout -> failover). Recover the lock so the
+                                            // next dispatch is not stuck for up to maxHoldMs (default 62 min).
+                                            if (errMessage.includes("session file locked") || errMessage.includes("SessionWriteLockTimeoutError")) {
+                                                console.warn(`[QQ] session write lock contention detected; attempting force-recovery: ${errMessage.slice(0, 200)}`);
+                                                void recoverStaleSessionLocks().then((removed) => {
+                                                    if (removed.length > 0) {
+                                                        console.warn(`[QQ] recovered ${removed.length} stale session lock(s); next dispatch will retry with a fresh lock`);
+                                                    }
+                                                });
+                                            }
                                             const fastFailWords = config.fastFailErrors || ["api key", "no api key found", "not found", "401", "unauthorized", "billing", "余额不足", "已欠费"];
                                             const shouldFastFail = fastFailWords.some((word: string) => errMessage.toLowerCase().includes(word.toLowerCase()));
 
@@ -4769,6 +4786,19 @@ ${current}
                             activeTaskIds.delete(taskKey);
                             if (typingCardActivated && isGroup) {
                                 clearGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
+                            }
+                            // If this run was aborted (superseded by a newer message) and the
+                            // gateway's abort-settle timed out, its session write lock may have
+                            // leaked (failover residue). Check after a grace period so a normal
+                            // run that is still legitimately holding the lock is not disturbed.
+                            // recoverStaleSessionLocks only touches locks owned by this gateway
+                            // process that are older than MIN_AGE_MS, so it is safe to scan all.
+                            if (wasAborted && config.enableSessionLockRecovery !== false) {
+                                setTimeout(() => {
+                                    void hasStaleSessionLock().then((stale) => {
+                                        if (stale) void recoverStaleSessionLocks();
+                                    });
+                                }, 15000);
                             }
                         }
                     };

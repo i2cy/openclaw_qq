@@ -80,6 +80,7 @@ export const QQConfigSchema = z.object({
   requireMention: BooleanInputSchema(true).describe("群聊触发门槛（含命令）。true=仅在被@/回复机器人/命中关键词时触发；若同时开启 keywordOnlyTrigger，则群聊只认关键词。false=群内普通消息与命令都可能触发（容易被刷，谨慎关闭）。"),
   systemPrompt: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("系统提示词。示例：你是一个高效、礼貌的助理。"),
   enableDeduplication: BooleanInputSchema(true).describe("启用消息去重，避免重复回复。"),
+  enableSessionLockRecovery: BooleanInputSchema(true).describe("启用会话写锁强制恢复。开启后，当 abort 超时导致 openclaw 会话写锁残留（SessionWriteLockTimeoutError）时，插件会自动删除属于本 gateway 进程的过期锁文件，避免会话被锁死最长 62 分钟。"),
   enableErrorNotify: BooleanInputSchema(true).describe("调用失败时是否给用户提示。"),
   adminOnlyChat: BooleanInputSchema(false).describe("仅管理员可触发聊天（防盗刷推荐开启）。"),
   notifyNonAdminBlocked: BooleanInputSchema(false).describe("启用管理员模式后，是否提示非管理员“无权限”。"),
