@@ -2938,7 +2938,13 @@ async function sendQQMediaMessage(params: {
     });
 
     const mediaMessage: OneBotMessage = [];
-    if (params.replyToId && !(params.text && params.text.trim())) mediaMessage.push({ type: "reply", data: { id: String(params.replyToId) } });
+    // Do NOT attach a [CQ:reply] to a text-less media message. replyToId here is
+    // usually auto-propagated by the SDK from the inbound message's own quote
+    // context (the message the human was replying to), which is not the message
+    // the bot is answering — quoting it produces a QQ message with ONLY a reply
+    // frame and no visible body. Explicit quoting (text + replyToId) is handled
+    // above by sendQQTextMessage; media itself stays standalone like the plain
+    // text path (which uses [CQ:at] instead of [CQ:reply]).
 
     const mediaKind = sourceKind;
     const audioLike = mediaKind === "audio";
