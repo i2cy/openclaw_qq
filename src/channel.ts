@@ -3426,6 +3426,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             await ensureLegacyQQSessionMigration();
             const config = account.config;
             accountConfigs.set(account.accountId, config);
+
             const adminIds = [...new Set(parseIdListInput(config.admins as string | number | Array<string | number> | undefined))];
             const allowedGroupIds = [...new Set(parseIdListInput(config.allowedGroups as string | number | Array<string | number> | undefined))];
             const blockedUserIds = [...new Set(parseIdListInput(config.blockedUsers as string | number | Array<string | number> | undefined))];
