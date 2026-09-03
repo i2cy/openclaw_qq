@@ -2398,12 +2398,13 @@ async function stageLocalFileForContainer(localPath: string, hostSharedDir: stri
 // Media upload timeout sized to the payload: NapCat reads/forwards the file
 // (or decodes an embedded base64) before it acks, and big files blow past a
 // fixed 15-30s. dad's rule (Sep 03): budget the transfer at 20Mbps, add a
-// fixed 20s margin, clamp to [45s, 10min]. Unknown sizes get a generous 120s.
+// 30s margin, clamp to [90s, 15min]. Unknown sizes get a generous 180s.
+// (40MB zip实测：NapCat→QQ服务器 45s 仍未 ack — 首测于 2026-09-03 超时)
 const QQ_UPLOAD_BANDWIDTH_BPS = 20 * 1000 * 1000;
-const QQ_UPLOAD_MARGIN_MS = 20 * 1000;
-const QQ_UPLOAD_MIN_TIMEOUT_MS = 45 * 1000;
-const QQ_UPLOAD_MAX_TIMEOUT_MS = 10 * 60 * 1000;
-const QQ_UPLOAD_UNKNOWN_SIZE_TIMEOUT_MS = 120 * 1000;
+const QQ_UPLOAD_MARGIN_MS = 30 * 1000;
+const QQ_UPLOAD_MIN_TIMEOUT_MS = 90 * 1000;
+const QQ_UPLOAD_MAX_TIMEOUT_MS = 15 * 60 * 1000;
+const QQ_UPLOAD_UNKNOWN_SIZE_TIMEOUT_MS = 180 * 1000;
 
 async function resolveOutboundMediaSizeBytes(fileRef: string, altLocalPath?: string | null): Promise<number | null> {
     if (altLocalPath) {
