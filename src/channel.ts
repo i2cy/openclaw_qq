@@ -9,11 +9,11 @@ import { promisify } from "node:util";
 declare const process: any;
 import {
     type ChannelPlugin,
-    type ChannelAccountSnapshot,
-    type ChannelSetupInput,
     type OpenClawConfig,
-    type ReplyPayload,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/channel-core";
+import { type ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
+import { type ChannelSetupInput } from "openclaw/plugin-sdk/channel-setup";
+import { type ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 import { buildChannelConfigSchema } from "openclaw/plugin-sdk/channel-config-schema";
 import { applyAccountNameToChannelSection, migrateBaseNameToDefaultAccount } from "openclaw/plugin-sdk/setup";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
@@ -4505,7 +4505,7 @@ ${current}
                             bodyForAgent: agentBody,
                         },
                         access: {
-                            commands: { authorized: commandAuthorized, authorizers: [] },
+                            commands: { authorized: commandAuthorized },
                         },
                         extra: {
                             ThreadLabel: sessionLabel,

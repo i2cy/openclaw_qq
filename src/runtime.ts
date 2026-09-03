@@ -1,4 +1,4 @@
-import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk/channel-core";
 
 let runtime: PluginRuntime | null = null;
 let pluginApi: OpenClawPluginApi | null = null;
