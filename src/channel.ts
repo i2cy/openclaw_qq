@@ -4622,6 +4622,12 @@ ${current}
                         const maxRetries = config.maxRetries ?? 3;
                         const retryDelayMs = config.retryDelayMs ?? 3000;
 
+                        // Transient-dispatch flags must live OUTSIDE the big try:
+                        // catch/finally clauses are sibling lexical blocks and cannot
+                        // see let-declarations made inside the try body.
+                        let admissionSkipped = false;
+                        let transientSessionSettle = false;
+
                         try {
                             const matchedAgentId = route.agentId;
                             const matchedAgentConfig = ((cfg as any).agents?.list || []).find((a: any) => a.id === matchedAgentId);
@@ -4654,7 +4660,6 @@ ${current}
 
                             const modelsToTry = [null, ...fallbacks];
                             let globalDispatchError: any = null;
-                            let admissionSkipped = false;
 
                             out_loop:
                             for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
@@ -4758,6 +4763,14 @@ ${current}
 
                                         if (globalDispatchError) {
                                             const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
+                                            // Transient gateway-side rejections while the PREVIOUS (aborted)
+                                            // turn's session is still settling ("changed while starting work",
+                                            // reply-operation-active, lock contention). These can persist
+                                            // far longer than maxRetries*retryDelayMs — flag for a long-tail
+                                            // auto-requeue in the finally block instead of dropping the msg.
+                                            if (/changed while starting work|reply-operation-active|session file locked|SessionWriteLockTimeout|busy|concurrent modification/i.test(errMessage)) {
+                                                transientSessionSettle = true;
+                                            }
                                             // openclaw's session write lock can leak when an aborted run's cleanup
                                             // stalls (abort settle timeout -> failover). Recover the lock so the
                                             // next dispatch is not stuck for up to maxHoldMs (default 62 min).
@@ -4807,13 +4820,8 @@ ${current}
                                                 // dropping the message on the floor.
                                                 admissionSkipped = true;
                                                 if (tryCount >= maxRetries || runState.isStale()) {
-                                                    if (!runState.isStale() && modelIndex === modelsToTry.length - 1 && config.enableErrorNotify !== false) {
-                                                        const lostMsg = "⚠️ 刚才那条消息撞上了上一轮的收尾窗口，没来得及处理——请再发一次。";
-                                                        console.log(`[QQ] Dispatch kept being admission-skipped after ${tryCount + 1} tries; notifying user.`);
-                                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${lostMsg}`);
-                                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostMsg);
-                                                        else client.sendPrivateMsg(userId, lostMsg);
-                                                    }
+                                                    // Long-tail requeue in the finally block handles the
+                                                    // retries + user notice; just bail out of this attempt.
                                                     break out_loop;
                                                 }
                                                 const waitMs = retryDelayMs * (tryCount + 1);
@@ -4826,7 +4834,7 @@ ${current}
                                             }
                                         }
 
-                                        if (tryCount === maxRetries) {
+                                        if (tryCount === maxRetries && !transientSessionSettle) {
                                                 if (modelIndex === modelsToTry.length - 1 && !runState.isStale()) {
                                                     if (globalDispatchError) {
                                                         const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
@@ -4875,6 +4883,62 @@ ${current}
                                         if (stale) void recoverStaleSessionLocks();
                                     });
                                 }, 15000);
+                            }
+
+                            // Long-tail requeue: when the gateway rejected this dispatch because
+                            // the PREVIOUS (aborted) turn's session was still settling ("Session
+                            // changed while starting work", reply-operation-active…), that settle
+                            // can outlive maxRetries*retryDelayMs by minutes (observed 3+ min on
+                            // Sep 03). Instead of dropping dad's interrupting message, requeue the
+                            // exact same payload with growing backoff until the session accepts it.
+                            if (!deliveredAnything && !runState.isStale() && (transientSessionSettle || admissionSkipped)) {
+                                const requeueCount = Number((mergedCtx as any).__qqRequeueCount || 0) + 1;
+                                const REQUEUE_BACKOFF_MS = [4000, 8000, 15000, 30000, 45000, 60000, 90000, 120000, 180000];
+                                const REQUEUE_MAX = REQUEUE_BACKOFF_MS.length;
+                                const requeueBackoffMs = REQUEUE_BACKOFF_MS[requeueCount - 1];
+                                if (requeueCount <= REQUEUE_MAX && requeueBackoffMs !== undefined) {
+                                    (mergedCtx as any).__qqRequeueCount = requeueCount;
+                                    if (requeueCount === 1) {
+                                        const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试（最长约 8 分钟），不用重发。";
+                                        console.log(`[QQ] dispatch hit transient session settle; scheduling long-tail requeue (attempt 1/${REQUEUE_MAX})`);
+                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${noticeText}`);
+                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, noticeText);
+                                        else client.sendPrivateMsg(userId, noticeText);
+                                    }
+                                    const attempt = requeueCount;
+                                    console.log(`[QQ] requeueing payload sess=${route.sessionKey} attempt=${attempt}/${REQUEUE_MAX} backoff=${requeueBackoffMs}ms`);
+                                    setTimeout(() => {
+                                        const s = sessionQueues.get(route.sessionKey);
+                                        if (!s) return;
+                                        // Retry drain until the session accepts the payload. A drain
+                                        // already in flight (new message arrived meanwhile) merges it.
+                                        let drainTries = 0;
+                                        const tryDrain = () => {
+                                            drainTries += 1;
+                                            const st = sessionQueues.get(route.sessionKey);
+                                            if (!st || drainTries > 12) return;
+                                            if (!st.isProcessing) {
+                                                st.pendingPayloads.push({
+                                                    ctxPayload: mergedCtx,
+                                                    storePath,
+                                                    executeDispatch,
+                                                    runEpoch: st.latestEpoch,
+                                                } as any);
+                                                if (st.timer) clearTimeout(st.timer);
+                                                st.timer = setTimeout(() => { st!.timer = null; void drainSessionQueue(route.sessionKey, config, () => { }); }, 0);
+                                            } else {
+                                                setTimeout(tryDrain, 10000);
+                                            }
+                                        };
+                                        tryDrain();
+                                    }, requeueBackoffMs);
+                                } else {
+                                    const lostText = "⚠️ 上一轮收尾超时（约 8 分钟），这条消息没能自动补上——请再发一次。";
+                                    console.warn(`[QQ] requeue budget exhausted for sess=${route.sessionKey}; notifying user.`);
+                                    if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${lostText}`);
+                                    else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostText);
+                                    else client.sendPrivateMsg(userId, lostText);
+                                }
                             }
                         }
                     };
