@@ -2431,6 +2431,54 @@ function uploadTimeoutMsForSize(sizeBytes: number | null): number {
     return Math.min(QQ_UPLOAD_MAX_TIMEOUT_MS, Math.max(QQ_UPLOAD_MIN_TIMEOUT_MS, Math.ceil(budgetMs)));
 }
 
+// NapCat's OneBot JSON payload has a hard ~9MB wall (40MB base64 = 56MB JSON
+// gets dropped with "Max payload size exceeded"; measured Sep 03: 8MB ok,
+// 10MB fail). Above this size we stop embedding bytes and instead POST the
+// file to the bridge service, which lands it inside the NapCat container and
+// returns a container-local path we can reference in the action JSON.
+const QQ_OUTBOUND_BRIDGE_MIN_BYTES = 8 * 1024 * 1024;
+
+async function stageViaBridge(params: {
+    localPath: string;
+    readFile?: (filePath: string) => Promise<Buffer>;
+    bridgeUrl: string;
+    bridgeToken: string;
+    fileName: string;
+}): Promise<string | null> {
+    const baseUrl = params.bridgeUrl.replace(/\/+$/, "");
+    try {
+        const data = params.readFile ? await params.readFile(params.localPath) : await fs.readFile(params.localPath);
+        const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15 * 60 * 1000);
+        try {
+            const headers: Record<string, string> = {
+                "Content-Type": "application/octet-stream",
+                "X-File-Name": params.fileName || "upload.bin",
+            };
+            if (params.bridgeToken) headers["Authorization"] = `Bearer ${params.bridgeToken}`;
+            const response = await fetch(`${baseUrl}/upload`, {
+                method: "POST",
+                headers,
+                body: new Uint8Array(buffer),
+                signal: controller.signal,
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || !payload?.ok) {
+                console.warn(`[QQ] bridge upload failed status=${response.status} err=${payload?.error || "unknown"}`);
+                return null;
+            }
+            console.log(`[QQ] staged via bridge: ${buffer.length} bytes -> ${payload.path}`);
+            return String(payload.path);
+        } finally {
+            clearTimeout(timer);
+        }
+    } catch (err) {
+        console.warn(`[QQ] bridge upload error: ${String(err)}`);
+        return null;
+    }
+}
+
 async function uploadGroupFile(
     client: OneBotClient,
     groupId: number,
@@ -2970,7 +3018,7 @@ async function sendQQMediaMessage(params: {
         textAck = await sendQQTextMessage({ client: params.client, to: params.to, text: params.text, replyToId: params.replyToId });
     }
 
-    const uploadableFileRef = await buildUploadableMediaRef({
+    let uploadableFileRef = await buildUploadableMediaRef({
         mediaUrl,
         localSourcePath,
         stagedSharedPath,
@@ -2982,6 +3030,27 @@ async function sendQQMediaMessage(params: {
     // die on NapCat's fixed-15s ack path.
     const outboundSizeBytes = await resolveOutboundMediaSizeBytes(uploadableFileRef, localSourcePath);
     const outboundTimeoutMs = uploadTimeoutMsForSize(outboundSizeBytes);
+
+    // Cross-host big-file path: when there is no local staging dir (NapCat
+    // runs in another machine/container), NapCat's OneBot JSON payload wall
+    // (~9MB) makes base64 embeds impossible above ~8MB. Route the bytes to
+    // the bridge service instead, which drops them into the NapCat container
+    // and returns a container-local path we can reference in the action.
+    const bridgeUrl = typeof runtimeCfg.outboundMediaBridgeUrl === "string" ? runtimeCfg.outboundMediaBridgeUrl.trim() : "";
+    const bridgeToken = typeof runtimeCfg.outboundMediaBridgeToken === "string" ? runtimeCfg.outboundMediaBridgeToken.trim() : "";
+    if (bridgeUrl && !stagedSharedPath && localSourcePath && (outboundSizeBytes ?? 0) > QQ_OUTBOUND_BRIDGE_MIN_BYTES) {
+        const bridgedPath = await stageViaBridge({
+            localPath: localSourcePath,
+            readFile,
+            bridgeUrl,
+            bridgeToken,
+            fileName,
+        });
+        if (bridgedPath) {
+            console.log(`[QQ] big file (${outboundSizeBytes} bytes) staged via bridge; uploading by container path`);
+            uploadableFileRef = bridgedPath;
+        }
+    }
 
     const mediaMessage: OneBotMessage = [];
     // Do NOT attach a [CQ:reply] to a text-less media message. replyToId here is

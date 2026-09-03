@@ -111,6 +111,8 @@ export const QQConfigSchema = z.object({
   enableTTS: BooleanInputSchema(false).describe("是否启用语音回复（依赖 OneBot 服务端支持）。"),
   sharedMediaHostDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：宿主机共享媒体目录（供 NapCat 容器访问）。示例：/Users/xxx/openclaw_qq/deploy/napcat/shared_media。"),
   sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),
+  outboundMediaBridgeUrl: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：大文件落盘桥接 URL（跨机部署时 NapCat 的 JSON 负载有 ~9MB 硬墙，>8MB 的文件由桥接服务落盘后按容器内路径引用发送）。示例：http://10.0.2.206:6199。"),
+  outboundMediaBridgeToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：落盘桥接的 Bearer token（与桥接服务启动环境 QQVC_TOKEN 一致，默认 qq-voice-bridge）。"),
   enableGuilds: BooleanInputSchema(true).describe("是否启用 QQ 频道（Guild）支持。"),
   enrichReplyForwardContext: BooleanInputSchema(false).describe("是否递归解析 reply/forward 并注入多层上下文。默认关闭（不显式开启则完全不注入 `<context_layers>` 块，避免上下文占用额外 token）；需要引用/合并转发线索时再手动开启。"),
   cacheInboundImagesToLocal: BooleanInputSchema(true).describe("是否将当前消息以及引用/转发上下文里识别到的图片缓存到本地 MediaPaths。默认开启，便于 ACP 与多模态 agent 实际读图；关闭后仅保留 URL 提示，部分 agent 可能只能看到文字。"),
