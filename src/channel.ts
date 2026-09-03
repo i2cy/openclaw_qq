@@ -2395,18 +2395,55 @@ async function stageLocalFileForContainer(localPath: string, hostSharedDir: stri
     }
 }
 
+// Media upload timeout sized to the payload: NapCat reads/forwards the file
+// (or decodes an embedded base64) before it acks, and big files blow past a
+// fixed 15-30s. dad's rule (Sep 03): budget the transfer at 20Mbps, add a
+// fixed 20s margin, clamp to [45s, 10min]. Unknown sizes get a generous 120s.
+const QQ_UPLOAD_BANDWIDTH_BPS = 20 * 1000 * 1000;
+const QQ_UPLOAD_MARGIN_MS = 20 * 1000;
+const QQ_UPLOAD_MIN_TIMEOUT_MS = 45 * 1000;
+const QQ_UPLOAD_MAX_TIMEOUT_MS = 10 * 60 * 1000;
+const QQ_UPLOAD_UNKNOWN_SIZE_TIMEOUT_MS = 120 * 1000;
+
+async function resolveOutboundMediaSizeBytes(fileRef: string, altLocalPath?: string | null): Promise<number | null> {
+    if (altLocalPath) {
+        try {
+            const st = await fs.stat(altLocalPath);
+            if (st.size > 0) return st.size;
+        } catch { }
+    }
+    if (fileRef && fileRef.startsWith("base64://")) {
+        const payloadLen = fileRef.length - "base64://".length;
+        return Math.floor((payloadLen * 3) / 4);
+    }
+    try {
+        const st = await fs.stat(fileRef);
+        if (st.size > 0) return st.size;
+    } catch { }
+    return null;
+}
+
+function uploadTimeoutMsForSize(sizeBytes: number | null): number {
+    if (sizeBytes === null || sizeBytes <= 0) return QQ_UPLOAD_UNKNOWN_SIZE_TIMEOUT_MS;
+    const secondsAt20Mbps = sizeBytes / (QQ_UPLOAD_BANDWIDTH_BPS / 8);
+    const budgetMs = secondsAt20Mbps * 1000 + QQ_UPLOAD_MARGIN_MS;
+    return Math.min(QQ_UPLOAD_MAX_TIMEOUT_MS, Math.max(QQ_UPLOAD_MIN_TIMEOUT_MS, Math.ceil(budgetMs)));
+}
+
 async function uploadGroupFile(
     client: OneBotClient,
     groupId: number,
     filePath: string,
     fileName: string,
+    sizeBytes?: number | null,
 ): Promise<{ ok: boolean; data?: any; error?: string }> {
     try {
+        const resolvedSize = await resolveOutboundMediaSizeBytes(filePath);
         const data = await (client as any).sendWithResponse("upload_group_file", {
             group_id: groupId,
             file: filePath,
             name: fileName,
-        }, 30000);
+        }, uploadTimeoutMsForSize(sizeBytes ?? resolvedSize));
         return { ok: true, data };
     } catch (err) {
         return { ok: false, error: String(err) };
@@ -2418,13 +2455,15 @@ async function uploadPrivateFile(
     userId: number,
     filePath: string,
     fileName: string,
+    sizeBytes?: number | null,
 ): Promise<{ ok: boolean; data?: any; error?: string }> {
     try {
+        const resolvedSize = await resolveOutboundMediaSizeBytes(filePath);
         const data = await (client as any).sendWithResponse("upload_private_file", {
             user_id: userId,
             file: filePath,
             name: fileName,
-        }, 30000);
+        }, uploadTimeoutMsForSize(sizeBytes ?? resolvedSize));
         return { ok: true, data };
     } catch (err) {
         return { ok: false, error: String(err) };
@@ -2436,15 +2475,16 @@ async function uploadFileToTarget(
     to: string,
     filePath: string,
     fileName: string,
+    sizeBytes?: number | null,
 ): Promise<{ ok: boolean; data?: any; error?: string; transport?: "upload_group_file" | "upload_private_file" }> {
     const groupId = parseGroupIdFromTarget(to);
     if (groupId) {
-        const result = await uploadGroupFile(client, groupId, filePath, fileName);
+        const result = await uploadGroupFile(client, groupId, filePath, fileName, sizeBytes);
         return { ...result, transport: "upload_group_file" };
     }
     const userId = parseUserIdFromTarget(to);
     if (userId) {
-        const result = await uploadPrivateFile(client, userId, filePath, fileName);
+        const result = await uploadPrivateFile(client, userId, filePath, fileName, sizeBytes);
         return { ...result, transport: "upload_private_file" };
     }
     return { ok: false, error: `File upload unsupported for target: ${to}` };
@@ -2768,16 +2808,16 @@ async function resolveInlineCqRecord(text: string): Promise<string> {
     return result;
 }
 
-async function sendOneBotMessageWithAck(client: OneBotClient, to: string, message: OneBotMessage | string): Promise<{ ok: boolean; data?: any; error?: string }> {
+async function sendOneBotMessageWithAck(client: OneBotClient, to: string, message: OneBotMessage | string, timeoutMs?: number): Promise<{ ok: boolean; data?: any; error?: string }> {
     try {
         if (to.startsWith("group:")) {
-            const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message);
+            const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message, timeoutMs);
             return { ok: true, data };
         }
         if (to.startsWith("guild:")) {
             const parts = to.split(":");
             if (parts.length >= 3) {
-                const data = await client.sendGuildChannelMsgAck(parts[1], parts[2], message);
+                const data = await client.sendGuildChannelMsgAck(parts[1], parts[2], message, timeoutMs);
                 return { ok: true, data };
             }
             return { ok: false, error: `Invalid guild target: ${to}` };
@@ -2786,7 +2826,7 @@ async function sendOneBotMessageWithAck(client: OneBotClient, to: string, messag
         if (!userId) {
             return { ok: false, error: `Invalid private target: ${to}` };
         }
-        const data = await client.sendPrivateMsgAck(userId, message);
+        const data = await client.sendPrivateMsgAck(userId, message, timeoutMs);
         return { ok: true, data };
     } catch (err) {
         return { ok: false, error: String(err) };
@@ -2937,6 +2977,11 @@ async function sendQQMediaMessage(params: {
         readFile,
     });
 
+    // Size-aware upload timeout (20Mbps budget + margin) so big files don't
+    // die on NapCat's fixed-15s ack path.
+    const outboundSizeBytes = await resolveOutboundMediaSizeBytes(uploadableFileRef, localSourcePath);
+    const outboundTimeoutMs = uploadTimeoutMsForSize(outboundSizeBytes);
+
     const mediaMessage: OneBotMessage = [];
     // Do NOT attach a [CQ:reply] to a text-less media message. replyToId here is
     // usually auto-propagated by the SDK from the inbound message's own quote
@@ -2959,7 +3004,7 @@ async function sendQQMediaMessage(params: {
     }
 
     if (fileLike) {
-        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
+        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName, outboundSizeBytes);
         if (uploadAck.ok) {
             return {
                 channel: "qq",
@@ -2988,12 +3033,12 @@ async function sendQQMediaMessage(params: {
         mediaMessage.push({ type: "file", data: { file: uploadableFileRef, name: fileName } });
     }
 
-    const mediaAck = await sendOneBotMessageWithAck(params.client, params.to, mediaMessage);
+    const mediaAck = await sendOneBotMessageWithAck(params.client, params.to, mediaMessage, outboundTimeoutMs);
     if (!mediaAck.ok) {
         const primaryError = mediaAck.error || "unknown";
         console.warn(`[QQ] media send failed url=${mediaUrl} kind=${mediaKind} err=${primaryError}`);
         const errorClass = classifyMediaError(primaryError);
-        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
+        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName, outboundSizeBytes);
         if (uploadAck.ok) {
             return {
                 channel: "qq",
@@ -4609,6 +4654,7 @@ ${current}
 
                             const modelsToTry = [null, ...fallbacks];
                             let globalDispatchError: any = null;
+                            let admissionSkipped = false;
 
                             out_loop:
                             for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
@@ -4750,9 +4796,33 @@ ${current}
                                                 break out_loop;
                                             }
 
-                                            if (dispatchDurationMs < 500) {
-                                                console.log(`[QQ] Message dropped by core queue policy (duration ${dispatchDurationMs}ms). Skipping retries.`);
-                                                break out_loop;
+                                            if (dispatchDurationMs < 1500) {
+                                                // The dispatch returned instantly with ZERO output — the
+                                                // gateway admission gate rejected it. Seen right after an
+                                                // interruptOnNewMessage abort: "skipped:
+                                                // reply-operation-active" while the aborted turn's session
+                                                // is still settling (dad, Sep 03: the abort fired but the
+                                                // interrupting message never got fed to the session). That
+                                                // rejection is transient, so back off and retry instead of
+                                                // dropping the message on the floor.
+                                                admissionSkipped = true;
+                                                if (tryCount >= maxRetries || runState.isStale()) {
+                                                    if (!runState.isStale() && modelIndex === modelsToTry.length - 1 && config.enableErrorNotify !== false) {
+                                                        const lostMsg = "⚠️ 刚才那条消息撞上了上一轮的收尾窗口，没来得及处理——请再发一次。";
+                                                        console.log(`[QQ] Dispatch kept being admission-skipped after ${tryCount + 1} tries; notifying user.`);
+                                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${lostMsg}`);
+                                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostMsg);
+                                                        else client.sendPrivateMsg(userId, lostMsg);
+                                                    }
+                                                    break out_loop;
+                                                }
+                                                const waitMs = retryDelayMs * (tryCount + 1);
+                                                console.log(`[QQ] Dispatch skipped by gateway admission (duration ${dispatchDurationMs}ms; try ${tryCount + 1}/${maxRetries + 1}); retrying in ${waitMs}ms`);
+                                                await sleep(waitMs);
+                                                if (runState.isStale()) {
+                                                    break out_loop;
+                                                }
+                                                continue;
                                             }
                                         }
 

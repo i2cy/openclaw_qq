@@ -178,8 +178,30 @@ export class OneBotClient extends EventEmitter {
       return;
     }
     if (payload.post_type === "notice") {
-      // OneBot notices (file received, group member changes, etc.) are NOT
-      // user messages — never feed them to the agent as empty text.
+      // OneBot notices are mostly system notifications (file received, group
+      // member changes…) — those are NOT user messages and must never feed the
+      // agent as empty text. EXCEPTION (dad, Sep 03): a 戳一戳 poke aimed at
+      // the bot is an actionable human gesture — re-synthesize it as a message
+      // so the bot can react. NapCat reports pokes as notice notify/poke.
+      if (
+        (payload as any).notice_type === "notify" &&
+        (payload as any).sub_type === "poke" &&
+        (payload as any).target_id !== undefined &&
+        String((payload as any).target_id) === String((payload as any).self_id ?? this.selfId)
+      ) {
+        const pokePayload: Record<string, any> = {
+          ...payload,
+          post_type: "message",
+          message_type: (payload as any).group_id ? "group" : "private",
+          user_id: (payload as any).user_id,
+          sender: { user_id: (payload as any).user_id, nickname: "", card: "" },
+          message: [{ type: "text", data: { text: "[动作] 用户戳了你一下" } }],
+          raw_message: "[动作] 用户戳了你一下",
+          message_id: undefined,
+        };
+        this.emit("message", pokePayload as any);
+        return;
+      }
       this.emit("notice", payload);
       return;
     }
@@ -203,16 +225,16 @@ export class OneBotClient extends EventEmitter {
     this.send("send_private_msg", { user_id: userId, message });
   }
 
-  async sendPrivateMsgAck(userId: number, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_private_msg", { user_id: userId, message }, 15000);
+  async sendPrivateMsgAck(userId: number, message: OneBotMessage | string, timeoutMs: number = 15000): Promise<any> {
+    return this.sendWithResponse("send_private_msg", { user_id: userId, message }, timeoutMs);
   }
 
   sendGroupMsg(groupId: number, message: OneBotMessage | string) {
     this.send("send_group_msg", { group_id: groupId, message });
   }
 
-  async sendGroupMsgAck(groupId: number, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_group_msg", { group_id: groupId, message }, 15000);
+  async sendGroupMsgAck(groupId: number, message: OneBotMessage | string, timeoutMs: number = 15000): Promise<any> {
+    return this.sendWithResponse("send_group_msg", { group_id: groupId, message }, timeoutMs);
   }
 
   deleteMsg(messageId: number | string) {
@@ -309,8 +331,8 @@ export class OneBotClient extends EventEmitter {
     this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
   }
 
-  async sendGuildChannelMsgAck(guildId: string, channelId: string, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message }, 15000);
+  async sendGuildChannelMsgAck(guildId: string, channelId: string, message: OneBotMessage | string, timeoutMs: number = 15000): Promise<any> {
+    return this.sendWithResponse("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message }, timeoutMs);
   }
 
   async getGuildList(): Promise<any[]> {
