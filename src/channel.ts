@@ -4828,6 +4828,21 @@ ${current}
                                         globalDispatchError = globalDispatchError || dispatcherError;
                                         const errMessage = globalDispatchError ? ((globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError)) : "";
                                         if (globalDispatchError) {
+                                            // If the turn errored AFTER visible reply text already reached
+                                            // deliver (e.g. core "incomplete turn" verdicts discard queued
+                                            // payloads and surface an error), flush what we have instead of
+                                            // wiping the buffers and retrying: the retry gets deduped by the
+                                            // kernel anyway, so dad loses a reply the model actually produced
+                                            // (observed 2026-09-26: incomplete turn, payloads=2 → retry →
+                                            // skipped:duplicate → nothing delivered).
+                                            if (deliveredAnything || sawReplyContent) {
+                                                const flushedUnknown = await flushBufferedUnknownTexts("error_with_visible_content");
+                                                if (flushedUnknown) deliveredAnything = true;
+                                                const flushedFinal = await flushBufferedFinalTexts();
+                                                if (flushedFinal) deliveredAnything = true;
+                                                console.warn(`[QQ] dispatch error after visible content (${errMessage.slice(0, 160)}); flushed buffered reply, skipping retry to avoid duplicates`);
+                                                break out_loop;
+                                            }
                                             resetBufferedUnknownTexts();
                                             resetBufferedFinalTexts();
                                         }
