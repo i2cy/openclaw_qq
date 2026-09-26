@@ -118,7 +118,7 @@ export const QQConfigSchema = z.object({
   cacheInboundImagesToLocal: BooleanInputSchema(true).describe("是否将当前消息以及引用/转发上下文里识别到的图片缓存到本地 MediaPaths。默认开启，便于 ACP 与多模态 agent 实际读图；关闭后仅保留 URL 提示，部分 agent 可能只能看到文字。"),
   blockStreaming: BooleanInputSchema(true).describe("是否按 assistant message 分块发送回复。默认开启，推荐配合 message_end，让 commentary/final 按完整消息落地。"),
   blockStreamingBreak: z.preprocess((value) => normalizeLooseString(value)?.toLowerCase(), z.enum(["text_end", "message_end"]).optional().default("message_end")).describe("分块发送的边界。默认 message_end：等单条 assistant message 完整生成后再发，更适合 QQ 群聊。"),
-  commentaryPayloads: BooleanInputSchema(true).describe("是否把中间轮次的评论性文本实时投递到 QQ（模型在工具调用之间产生的可见文本，如“稍等，正在画…”）。默认开启；内核默认会丢弃这些 commentary payload（replyOptions.commentaryPayloadsEnabled），必须显式开启才会送达。关闭则只发回合最终回复。"),
+  commentaryPayloads: BooleanInputSchema(true).describe("是否把中间轮次的评论性文本实时投递到 QQ（模型在工具调用之间产生的可见文本，如“稍等，正在画…”）。默认开启。实现：插件通过 replyOptions.onItemEvent 接收核心的 preamble 进度事件并自行发送（completions 模型的中间文本被 harness 打上 commentary 签名后不会进入常规 block 管线，这是唯一受支持出口）；同时插件独占 commentary 所有权，避免 verbose 模式的 💬 通道把最终回复重复发送。中间文本会被折叠为单行，[[tts:text]] 标签解包为文字，MEDIA: 指令被忽略。关闭则只发回合最终回复。"),
   maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),
   maxForwardLayers: NumberInputSchema(5).describe("forward 最大递归层数。默认 5。"),
   maxForwardMessagesPerLayer: NumberInputSchema(8).describe("每层 forward 最多展开多少条子消息。默认 8。"),

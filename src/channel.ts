@@ -2688,6 +2688,19 @@ function normalizeAssistantTextPhase(value: unknown): "commentary" | "final_answ
     return value === "commentary" || value === "final_answer" ? value : undefined;
 }
 
+// Mid-turn commentary arrives via item/preamble events as raw whitespace-collapsed
+// text — it can still carry [[tts:text]] voice tags and MEDIA: directives that the
+// normal deliver() pipeline would have processed. Unwrap voice tags to their visible
+// text and drop MEDIA: directives (media only flows through the final/block path).
+function cleanCommentaryProgressText(raw: string): string {
+    return raw
+        .replace(/\[\[tts:text\]\]([\s\S]*?)\[\[\/tts:text\]\]/gi, (_m, inner: string) => ` ${inner} `)
+        .replace(/\[\[tts:text\]\]([\s\S]*)$/gi, (_m, inner: string) => ` ${inner} `)
+        .replace(/MEDIA:\S+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
 function resolveReplyPayloadPhase(payload: any): "commentary" | "final_answer" | undefined {
     const directPhase = normalizeAssistantTextPhase(payload?.phase);
     if (directPhase) return directPhase;
@@ -4815,11 +4828,41 @@ ${current}
                                                 },
                                                 replyOptions: {
                                                     abortSignal: abortController.signal,
-                                                    // 内核默认丢弃中间轮次的 commentary 文本（isCommentary &&
-                                                    // !commentaryPayloadsEnabled → return），只有最终回复会送达。
-                                                    // 打开后模型在工具调用之间的可见文本实时发到 QQ；dad 2026-09-27
-                                                    // 实测确认过默认行为会吞掉“正在画…”这类中间消息。
+                                                    // ── mid-turn commentary delivery (2026-09-27, dad) ──
+                                                    // completions-API 模型(k3 等)的中间轮次文本被传输层打上
+                                                    // phase:"commentary" 签名,harness 在 message_end 直接抑制
+                                                    // (suppressVisibleAssistantOutput),永不进入 block 管线;
+                                                    // 唯一受支持出口是 {kind:"preamble",progressText} item 事件。
+                                                    // 组合拳:
+                                                    // - onItemEvent: 插件自渲染中间正文(仅 phase="end" 完整消息)
+                                                    // - suppressDefaultToolProgressMessages: 声明"频道自管进度",
+                                                    //   允许 quiet(verbose=off)模式下转发 item 事件,且不喷工具名
+                                                    // - shouldDeliverCommentaryPayloads:()=>false + commentaryPayloadsEnabled:
+                                                    //   插件成为 commentary 唯一 owner,关掉核心 💬 独立进度通道
+                                                    //   (verbose=on 时它会把 final 重复发两次 — 2026-09-27 实锤)
                                                     commentaryPayloadsEnabled: config.commentaryPayloads !== false,
+                                                    ...(config.commentaryPayloads !== false ? {
+                                                        shouldDeliverCommentaryPayloads: () => false,
+                                                        suppressDefaultToolProgressMessages: true,
+                                                        onItemEvent: async (item: any) => {
+                                                            if (item?.kind !== "preamble" || item?.phase !== "end") return;
+                                                            const raw = typeof item.progressText === "string" ? item.progressText : "";
+                                                            const t = cleanCommentaryProgressText(raw);
+                                                            if (!t || currentRunState?.isStale()) return;
+                                                            try {
+                                                                const processed = await prepareOutgoingText(t);
+                                                                if (currentRunState?.isStale() || !processed.trim()) return;
+                                                                sawReplyContent = true;
+                                                                const sent = await sendProcessedText(processed);
+                                                                if (sent) deliveredAnything = true;
+                                                                if (config.debugLayerTrace) {
+                                                                    console.log(`[QQLayerTrace] commentary preamble sent len=${t.length} itemId=${String(item.itemId ?? "-")}`);
+                                                                }
+                                                            } catch (e: any) {
+                                                                console.warn(`[QQ] commentary preamble send failed: ${String(e?.message ?? e)}`);
+                                                            }
+                                                        },
+                                                    } : {}),
                                                 },
                                             });
                                             if (!runState.isStale()) {
