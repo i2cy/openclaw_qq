@@ -3196,6 +3196,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     label: "分块发送边界",
                     help: "默认 message_end。每条 assistant message 完成后再发，更适合 QQ 群聊，也能减少工具调用前后的边界丢失。",
                 },
+                commentaryPayloads: {
+                    label: "中间轮次评论实时送达",
+                    help: "默认开启。模型在工具调用之间说的可见文本（如“稍等，正在画…”）实时发到 QQ；关闭则只保留回合最终回复。",
+                },
                 enrichReplyForwardContext: {
                     label: "解析 reply/forward 多层上下文",
                     help: "默认开启。会递归展开引用和合并转发内容，方便模型理解‘你在回谁、上下文是什么’。",
@@ -4811,6 +4815,11 @@ ${current}
                                                 },
                                                 replyOptions: {
                                                     abortSignal: abortController.signal,
+                                                    // 内核默认丢弃中间轮次的 commentary 文本（isCommentary &&
+                                                    // !commentaryPayloadsEnabled → return），只有最终回复会送达。
+                                                    // 打开后模型在工具调用之间的可见文本实时发到 QQ；dad 2026-09-27
+                                                    // 实测确认过默认行为会吞掉“正在画…”这类中间消息。
+                                                    commentaryPayloadsEnabled: config.commentaryPayloads !== false,
                                                 },
                                             });
                                             if (!runState.isStale()) {

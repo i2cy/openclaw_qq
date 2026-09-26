@@ -238,6 +238,7 @@ openclaw setup qq
 | `interruptOnNewMessage` | boolean | `false` | 同会话收到新消息时，是否软中断上一轮回复并切换到最新请求。默认关闭。 |
 | `blockStreaming` | boolean | `true` | 是否按 assistant message 分块发送回复。默认开启；开启后 commentary / final 都可以按消息边界落地。 |
 | `blockStreamingBreak` | string | `message_end` | 分块发送边界。默认 `message_end`，即每条 assistant message 完整后再发；`text_end` 会更碎、更接近逐段流式。 |
+| `commentaryPayloads` | boolean | `true` | 中间轮次评论实时送达:模型在工具调用之间说的可见文本(如"稍等,正在画…")实时发到 QQ。内核默认丢弃 commentary payload,本插件显式开启;关闭则只发回合最终回复。 |
 | `forwardLongReplyThreshold` | number | `300` | `final_answer` 超过该字符数时自动改用 QQ 合并转发；`commentary` 仍按普通消息发送。默认 `300`。 |
 | `forwardNodeCharLimit` | number | `0` | 长回复合并转发时，每个节点的字符上限。默认 `0` 表示不按长度拆节点，尽量把同一轮回复放进一个转发。 |
 | `forwardNodeName` | string | `OpenClaw` | 长回复合并转发时，节点显示名称。 |
