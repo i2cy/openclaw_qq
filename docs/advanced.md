@@ -254,6 +254,9 @@ openclaw setup qq
 | `adaptiveQuietHours` | string | `23:30-08:00` | 静默时段(本地时间,支持跨午夜),时段内不主动插嘴;@提及照常。留空关闭。 |
 | `adaptiveReframeAfterMs` | number | `86400000` | 完整制度框架最长间隔(默认 24h = 至少一天一次制度提醒)。其余注入只带一行心情+消息列表。框架保留三重保障:①实测会话 `compactionCount`,压缩后立即重发(同一会话上下文始终至少保留一次提醒);②`/newsession` 立即重置;③每 `adaptiveReframeEveryN` 次精简注入强制重发(探测失败兜底)。 |
 | `adaptiveReframeEveryN` | number | `8` | 每 N 次精简注入后强制重发完整框架(压缩探测失败时的兜底;0=关闭)。 |
+| `groupAtCooldownMs` | number | `600000` | 群 @ 冷却:任何一次 @ 之后,这段时间内该群回复不再 @ 任何人。0=不抑制。 |
+| `groupAtSlowMs` | number | `600000` | 长任务汇报 @ 阈值:单次 inbound 响应耗时超过该值时 @ 发起人汇报结果。0=禁用。 |
+| `groupAtAdaptive` | boolean | `true` | 主动插嘴的回复 @ 触发人(仍受 @ 冷却约束)。 |
 | `adaptiveDryRun` | boolean | `false` | 只判定+写审计日志 `/tmp/qq_adaptive.log`,不注入回复。 |
 | `adaptiveTrace` | boolean | `false` | 详细判定过程日志。 |
 | `adaptiveMaxPerHour` | number | `20` | 每群每小时判定上限(成本护栏)。 |
@@ -613,3 +616,13 @@ A: 将 `enableTTS` 设为 `true`。注意：这取决于 OneBot 服务端是否�
 - 管理命令(仅 admin):`/adaptive status` `/adaptive criteria [文本]` `/adaptive relearn`。
 - 注意:白名单群必须同时在 `allowedGroups` 内(若其非空);`adminOnlyChat` 开启的群里
   非 admin 消息不会触发判定(注入会被管理闸门拦截,直接不判)。
+
+
+## 群 @ 策略(2026-09-28, dad)
+
+**普通即时回复一律不 @**(条条 @ 太机械)。只有两种情况 @:
+1. **主动插嘴**(自适应触发):@ 触发人——但任何一次 @ 之后 `groupAtCooldownMs`(默认10分钟)内该群不再 @ 任何人;
+2. **长任务汇报**:一次 inbound 的响应耗时超过 `groupAtSlowMs`(默认10分钟,如跑了个复杂任务)后发出结果时,@ 发起人。
+
+针对性通知不受策略约束(照旧 @):错误提示/空回复 fallback、排队重试通知、adminOnlyChat 拦截提示、斜杠命令回执。
+每次策略 @ 都打日志:`[QQ] group-at: reason=adaptive|slow(Ns) group=... target=...`。

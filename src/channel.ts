@@ -1650,6 +1650,10 @@ const clients = new Map<string, OneBotClient>();
 const allClientsByAccount = new Map<string, Set<OneBotClient>>();
 const accountConfigs = new Map<string, QQConfig>();
 const blockedNotifyCache = new Map<string, number>();
+// 群 @ 策略(dad 2026-09-28):记录每群最近一次 @ 的时间,任何 @ 之后
+// groupAtCooldownMs 内该群不再 @ 任何人。只有两种情况该 @:
+// ①主动插嘴(@触发人) ②单次 inbound 响应很久后的结果汇报(@发起人)。
+const lastGroupAtAt = new Map<string, number>();
 const activeTaskIds = new Set<string>();
 const groupBusyCounters = new Map<string, number>();
 const groupBaseCards = new Map<string, string>();
@@ -3258,6 +3262,18 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     label: "只判定不插嘴(dry run)",
                     help: "判定照常跑并写审计日志 /tmp/qq_adaptive.log,但不注入回复。调教判据期用。",
                 },
+                groupAtCooldownMs: {
+                    label: "群 @ 冷却(毫秒)",
+                    help: "任何一次 @ 之后,这段时间内该群回复不再 @ 任何人。默认 600000(10分钟)。",
+                },
+                groupAtSlowMs: {
+                    label: "长任务汇报 @ 阈值(毫秒)",
+                    help: "响应耗时超过该值才 @ 发起人汇报结果。默认 600000(10分钟);普通即时回复一律不 @。",
+                },
+                groupAtAdaptive: {
+                    label: "主动插嘴时 @ 触发人",
+                    help: "默认开启;仍受群 @ 冷却约束(刚 @ 过就不再 @)。",
+                },
                 enrichReplyForwardContext: {
                     label: "解析 reply/forward 多层上下文",
                     help: "默认开启。会递归展开引用和合并转发内容，方便模型理解‘你在回谁、上下文是什么’。",
@@ -4395,6 +4411,26 @@ ${current}
                         ? buildReplySessionSourcePrefix(activeTempSlot)
                         : "";
 
+                    // ── 群 @ 策略(dad 2026-09-28)──────────────────────────────
+                    // 只有两种情况该 @:①主动插嘴(@触发人);②本次 inbound 响应
+                    // 耗时超过 groupAtSlowMs(如跑了个长任务)后汇报结果(@发起人)。
+                    // 任何一次 @ 之后 groupAtCooldownMs 内本群不再 @ 任何人;
+                    // 普通即时回复一律不 @(条条 @ 太机械)。
+                    const inboundReceivedAt = Date.now();
+                    const groupAtKey = `${account.accountId}:${groupId}`;
+                    const decideGroupAt = (): string | null => {
+                        if (!isGroup) return null;
+                        const liveCfg: any = accountConfigs.get(account.accountId) ?? config;
+                        const now = Date.now();
+                        const cooldownMs = Math.max(0, Number(liveCfg.groupAtCooldownMs ?? 600000));
+                        if (cooldownMs > 0 && now - (lastGroupAtAt.get(groupAtKey) ?? 0) < cooldownMs) return null;
+                        if (adaptiveSynthetic && liveCfg.groupAtAdaptive !== false) return "adaptive";
+                        const slowMs = Math.max(0, Number(liveCfg.groupAtSlowMs ?? 600000));
+                        const elapsedMs = now - inboundReceivedAt;
+                        if (slowMs > 0 && elapsedMs >= slowMs) return `slow(${Math.round(elapsedMs / 1000)}s)`;
+                        return null;
+                    };
+
                     const takeReplySessionSourcePrefix = (): string => {
                         if (!pendingReplySessionSourcePrefix) return "";
                         const prefix = pendingReplySessionSourcePrefix;
@@ -4449,7 +4485,14 @@ ${current}
                         for (let i = 0; i < chunks.length; i++) {
                             if (currentRunState?.isStale()) return i > 0;
                             let chunk = chunks[i];
-                            if (isGroup && i === 0) chunk = `[CQ:at,qq=${userId}] ${chunk}`;
+                            if (isGroup && i === 0) {
+                                const atReason = decideGroupAt();
+                                if (atReason) {
+                                    chunk = `[CQ:at,qq=${userId}] ${chunk}`;
+                                    lastGroupAtAt.set(groupAtKey, Date.now());
+                                    console.log(`[QQ] group-at: reason=${atReason} group=${groupId} target=${userId}`);
+                                }
+                            }
 
                             if (isGroup) client.sendGroupMsg(groupId, chunk);
                             else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, chunk);

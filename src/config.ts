@@ -139,6 +139,10 @@ export const QQConfigSchema = z.object({
   adaptiveMaxPerHour: NumberInputSchema(20).describe("每群每小时判定次数上限(成本护栏)。默认 20。"),
   adaptiveReframeAfterMs: NumberInputSchema(86400000).describe("完整制度框架的最长间隔(毫秒,默认 24h=至少一天一次制度提醒)。其余注入只带一行心情+消息列表;会话被压缩(compactionCount 实测)或 /newsession 时立即重发框架,保证同一会话上下文里始终至少保留一次提醒。"),
   adaptiveReframeEveryN: NumberInputSchema(8).describe("每 N 次精简注入后强制重发一次完整框架(压缩探测失败时的兜底,默认 8;0=关闭)。"),
+  // ── 群 @ 策略(dad 2026-09-28:只有主动插嘴和长任务汇报该 @)──
+  groupAtCooldownMs: NumberInputSchema(600000).describe("同一群两次 @ 之间的最小间隔(毫秒)。任何一次 @ 之后的这段时间内,该群回复不再 @ 任何人。默认 600000(10分钟);0=不抑制。"),
+  groupAtSlowMs: NumberInputSchema(600000).describe("单次 inbound 从收到到发出某条回复超过该时长(毫秒)时,视为长任务汇报,@ 发起人。默认 600000(10分钟);0=禁用此规则。普通即时回复一律不 @。"),
+  groupAtAdaptive: BooleanInputSchema(true).describe("主动插嘴(自适应触发)的回复是否 @ 触发人。默认开启(仍受 groupAtCooldownMs 抑制)。"),
   adaptiveNotifyUser: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("自适应功能的私聊通知对象(判据引导完成等)。留空=admins 名单第一位。"),
   maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),
   maxForwardLayers: NumberInputSchema(5).describe("forward 最大递归层数。默认 5。"),
