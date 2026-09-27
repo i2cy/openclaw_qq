@@ -25,7 +25,8 @@ import {
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime, pushSteerText, drainSteerTexts } from "./runtime.js";
-import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
+import * as adaptive from "./adaptive.js";
+import type { OneBotEvent, OneBotMessage, OneBotMessageSegment } from "./types.js";
 import { recoverStaleSessionLocks, hasStaleSessionLock } from "./session-lock-recovery.js";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
@@ -3211,7 +3212,51 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 },
                 commentaryPayloads: {
                     label: "中间轮次评论实时送达",
-                    help: "默认开启。模型在工具调用之间说的可见文本（如“稍等，正在画…”）实时发到 QQ；关闭则只保留回合最终回复。",
+                    help: "默认开启。模型在工具调用之间说的可见文本(如“稍等,正在画…”)实时发到 QQ;关闭则只保留回合最终回复。",
+                },
+                adaptiveGroups: {
+                    label: "自适应触发白名单群",
+                    help: "群号列表(逗号分隔),空=功能关闭。白名单群里无需 @/关键词,由判定模型按人格+判据决定是否主动插嘴;@提及路径不受影响。",
+                },
+                adaptiveAdminsOnly: {
+                    label: "仅管理员消息触发判定",
+                    help: "默认关闭(任何成员消息都可触发判定)。开启后只有 admins 名单成员的新消息会发起判定。",
+                },
+                adaptiveRecordScope: {
+                    label: "窗口记录范围",
+                    help: "all=记录所有成员消息(默认);admins=仅记录 admins 名单成员。",
+                },
+                adaptiveWindowMaxMessages: {
+                    label: "窗口最大条数",
+                    help: "每群滚动窗口消息上限,默认 60;超出从最旧淘汰(adaptiveWindowMinDays 内受保护)。",
+                },
+                adaptiveWindowMinDays: {
+                    label: "窗口最少保留天数",
+                    help: "默认 2 天:安静群的消息不会因为条数上限被过早淘汰。",
+                },
+                adaptiveCooldownMs: {
+                    label: "判定冷却(毫秒)",
+                    help: "同一群两次判定最小间隔,默认 120000(2分钟)。",
+                },
+                adaptiveReplyCooldownMs: {
+                    label: "插嘴后冷却(毫秒)",
+                    help: "实际发出插嘴回复后的更长冷却,默认 600000(10分钟),防连环插嘴。",
+                },
+                adaptiveJudgeModel: {
+                    label: "判定模型",
+                    help: "provider/model 格式,凭据取自 models.providers。默认(留空)=dgx-spark/qwen3.8-flash-next(本地免费)。每次判定含 ~20k tokens 人格头,建议本地/廉价模型。",
+                },
+                adaptiveReplyCriteria: {
+                    label: "插嘴判据",
+                    help: "留空时首次启用自动引导生成(模型带人格列出想插嘴的情形)并写入本字段;可随时手改。群内 /adaptive criteria|relearn 亦可管理。",
+                },
+                adaptiveQuietHours: {
+                    label: "静默时段",
+                    help: "HH:MM-HH:MM(本地时间,支持跨午夜),时段内不主动插嘴;@提及照常。默认 23:30-08:00,留空关闭。",
+                },
+                adaptiveDryRun: {
+                    label: "只判定不插嘴(dry run)",
+                    help: "判定照常跑并写审计日志 /tmp/qq_adaptive.log,但不注入回复。调教判据期用。",
                 },
                 enrichReplyForwardContext: {
                     label: "解析 reply/forward 多层上下文",
@@ -3449,6 +3494,17 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             const blockedUserIds = [...new Set(parseIdListInput(config.blockedUsers as string | number | Array<string | number> | undefined))];
             const blockedNotifyCooldownMs = Math.max(0, Number(config.blockedNotifyCooldownMs ?? 10000));
 
+            // ── adaptive group trigger: 配置快照 + 窗口重载 + 判据引导 ──
+            adaptive.loadPersistedWindows();
+            const adaptiveCfg = adaptive.adaptiveConfigure(account.accountId, config as any, {
+                adminIds,
+                selfIdGetter: () => clients.get(account.accountId)?.getSelfId(),
+            });
+            adaptive.attachSender(account.accountId, {
+                sendPrivate: (uid, text) => { clients.get(account.accountId)?.sendPrivateMsg(Number(uid), text); },
+            });
+            if (adaptiveCfg.enabled) void adaptive.bootstrapCriteriaIfNeeded(account.accountId);
+
             if (!config.wsUrl) throw new Error("QQ: wsUrl is required");
 
             const existingLiveClient = clients.get(account.accountId);
@@ -3536,10 +3592,14 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 // which made the model reply "I didn't receive any text..."
                 const noticeType = (event as any)?.notice_type ?? "unknown";
                 const target = (event as any)?.group_id ? `group:${(event as any).group_id}` : (event as any)?.user_id ? `user:${(event as any).user_id}` : "-";
+                // 群消息撤回 → 同步清理自适应窗口条目(judge 不应看到已撤回的话)
+                if (noticeType === "group_recall" && (event as any)?.group_id && (event as any)?.message_id) {
+                    adaptive.onRecall(account.accountId, String((event as any).group_id), String((event as any).message_id));
+                }
                 console.log(`[QQ] notice swallowed type=${noticeType} target=${target}`);
             });
 
-            client.on("message", async (event) => {
+            const onMessageEvent = async (event: any) => {
                 try {
                     if (isStaleGeneration()) return;
                     getQQRuntime().channel.activity.record({
@@ -3753,6 +3813,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     else if (isGroup && /^\/modelsync\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
                         text = "/modelsync";
+                    }
+                    else if (isGroup && /^\/adaptive\b/i.test(inlineCommand)) {
+                        if (!isAdmin) return;
+                        text = inlineCommand;
                     }
 
                     const normalizedTextForCommand = normalizeSlashVariants(text).trim();
@@ -4012,6 +4076,31 @@ ${current}
                             else client.sendPrivateMsg(userId, okMsg);
                             return;
                         }
+                        if (cmd === '/adaptive') {
+                            const sub = (parts[1] || 'status').toLowerCase();
+                            const sendAdaptive = (msg: string) => {
+                                if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${msg}`);
+                                else client.sendPrivateMsg(userId, msg);
+                            };
+                            if (sub === 'status') {
+                                sendAdaptive(adaptive.adaptiveStatus(account.accountId, isGroup ? String(groupId) : undefined));
+                            } else if (sub === 'criteria') {
+                                const criteriaText = parts.slice(2).join(' ').trim();
+                                if (!criteriaText) {
+                                    const current = adaptive.currentCriteria(account.accountId);
+                                    sendAdaptive(current ? `📋 当前插嘴判据:\n${current.slice(0, 3500)}` : "尚无判据(启用白名单群后会自动引导生成,或用 /adaptive criteria <文本> 直接设置)。");
+                                } else {
+                                    const ok = adaptive.setCriteriaConfig(account.accountId, criteriaText);
+                                    sendAdaptive(ok ? "✅ 判据已写入配置(热更新生效)。" : "❌ 配置写入失败,请查看 gateway 日志。");
+                                }
+                            } else if (sub === 'relearn') {
+                                sendAdaptive("🧠 正在重新引导判据(完成后私聊通知第一位 admin)…");
+                                void adaptive.relearnCriteria(account.accountId);
+                            } else {
+                                sendAdaptive("用法: /adaptive status | criteria [新判据文本] | relearn");
+                            }
+                            return;
+                        }
                         if (cmd === '/status') {
                             const activeCount = countActiveTasksForAccount(account.accountId);
                             const statusMsg = `[OpenClawd QQ]\nState: Connected\nSelf ID: ${client.getSelfId()}\nMemory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB\nActiveTasks: ${activeCount}`;
@@ -4121,8 +4210,33 @@ ${current}
                         } catch (e) { }
                     }
 
+                    // ── 自适应群聊触发:白名单群消息先进滚动窗口(所有路径都记录,
+                    // 含稍后走正常 dispatch 的消息,保持 judge 上下文连续) ──
+                    const adaptiveSynthetic = isGroup && adaptive.isSynthetic(event.message_id);
+                    let adaptiveEntry: adaptive.AdaptiveWindowEntry | null = null;
+                    if (isGroup && !adaptiveSynthetic && adaptive.isAdaptiveGroup(account.accountId, String(groupId))) {
+                        adaptiveEntry = adaptive.recordGroupMessage({
+                            accountId: account.accountId,
+                            groupId: String(groupId),
+                            messageId: String(event.message_id ?? Date.now()),
+                            ts: (Number(event.time) || 0) * 1000 || Date.now(),
+                            userId: String(userId),
+                            nickname: String(event.sender?.card || event.sender?.nickname || userId),
+                            text,
+                            isAdmin,
+                            replyToMessageId: typeof replyMsgId !== "undefined" && replyMsgId != null ? String(replyMsgId) : undefined,
+                            imageHints: imageHints.slice(0, 5),
+                            cacheImages: config.cacheInboundImagesToLocal !== false && imageHints.length > 0
+                                ? async () => {
+                                    const cached = await cacheImageHintsLocally(imageHints.slice(0, 5), imageHintMeta);
+                                    return cached.entries.map((e: any) => ({ url: e.url, path: e.path, type: e.type }));
+                                }
+                                : undefined,
+                        });
+                    }
+
                     const keywordOnlyTrigger = Boolean(config.keywordOnlyTrigger) && isGroup;
-                    let isTriggered = forceTriggered || !isGroup || text.includes("[动作] 用户戳了你一下");
+                    let isTriggered = forceTriggered || !isGroup || adaptiveSynthetic || text.includes("[动作] 用户戳了你一下");
                     let keywordTriggered = false;
                     if (!isTriggered && keywordTriggers.length > 0) {
                         for (const kw of keywordTriggers) {
@@ -4138,7 +4252,10 @@ ${current}
                     let mentionedByReply = false;
 
                     const checkMention = isGroup || isGuild;
-                    if (keywordOnlyTrigger && !isTriggered) return;
+                    if (keywordOnlyTrigger && !isTriggered) {
+                        if (adaptiveEntry) adaptive.considerTrigger(account.accountId, String(groupId), adaptiveEntry);
+                        return;
+                    }
                     if (checkMention && config.requireMention && !keywordOnlyTrigger && !isTriggered) {
                         const selfId = client.getSelfId();
                         const effectiveSelfId = selfId ?? event.self_id;
@@ -4156,7 +4273,11 @@ ${current}
                         if (!mentionedByAt && repliedMsg?.sender?.user_id === effectiveSelfId) {
                             mentionedByReply = true;
                         }
-                        if (!mentionedByAt && !mentionedByReply) return;
+                        if (!mentionedByAt && !mentionedByReply) {
+                            // 消息被正常路径丢弃 → 交给自适应触发判定
+                            if (adaptiveEntry) adaptive.considerTrigger(account.accountId, String(groupId), adaptiveEntry);
+                            return;
+                        }
                     }
 
                     if (config.adminOnlyChat && !isAdmin) {
@@ -4339,6 +4460,8 @@ ${current}
 
                             if (chunks.length > 1 && config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                         }
+                        // 自适应窗口:Cody 自己的群发言镜像入窗(judge 需要看到她说过什么)
+                        if (isGroup && chunks.length > 0) adaptive.recordSelfMessage(account.accountId, String(groupId), processed);
                         return chunks.length > 0;
                     };
 
@@ -4359,6 +4482,7 @@ ${current}
                             });
                             if (currentRunState?.isStale()) return false;
                             if (sentAsForward) {
+                                if (isGroup) adaptive.recordSelfMessage(account.accountId, String(groupId), `[合并转发 ${texts.length} 条] ${texts.join(" ")}`);
                                 console.log(`[QQ] merged-forward delivered phase=${meta.phaseLabel} blocks=${texts.length} len=${totalLen} threshold=${forwardThreshold} group=${groupId}${meta.reason ? ` reason=${meta.reason}` : ""}`);
                                 return true;
                             }
@@ -4580,6 +4704,13 @@ ${current}
                     }
                     agentBody = systemBlock + cleanBody;
 
+                    // 自适应触发的合成消息:注入判定器选中的完整上下文块(隐藏于
+                    // 模型侧,Body 仍是短标记,dashboard 可见内容不刷屏)
+                    const adaptiveOverride = adaptiveSynthetic ? adaptive.takeOverride(event.message_id) : null;
+                    if (adaptiveOverride) {
+                        agentBody = systemBlock + adaptiveOverride.contextBlock + cleanBody;
+                    }
+
                     const inboundMediaUrls = Array.from(new Set([
                         ...extractImageUrls(event.message),
                         ...imageHints,
@@ -4592,6 +4723,8 @@ ${current}
                     const inboundMediaPayload = buildInboundMediaPayloadFromEntries([
                         ...cachedInboundImages.entries,
                         ...attachmentMediaEntries,
+                        // 自适应注入:judge 选中消息的真实图片(记录时已缓存到本地)
+                        ...(adaptiveOverride?.mediaEntries ?? []).map((m) => ({ url: m.url, path: m.path, type: m.type })),
                     ]);
                     if (config.debugLayerTrace) {
                         const mediaPathCount = Array.isArray((inboundMediaPayload as any).MediaPaths)
@@ -5047,6 +5180,14 @@ ${current}
                             if (qFinal && qFinal.currentAbort === abortController) qFinal.currentAbort = undefined;
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
+                            if (isGroup) {
+                                // 自适应触发:合成回合完成 → 状态机推进(排队的触发消息按冷却再判一次)
+                                adaptive.releaseOverride(event.message_id);
+                                adaptive.onTurnComplete(account.accountId, String(groupId), {
+                                    delivered: deliveredAnything || sawReplyContent,
+                                    synthetic: adaptiveSynthetic,
+                                });
+                            }
                             if (typingCardActivated && isGroup) {
                                 clearGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
                             }
@@ -5122,6 +5263,10 @@ ${current}
                         }
                     };
 
+                    // 正常路径(@/关键词/命令)即将 dispatch:窗口全部标记已注入,
+                    // 取消待判定(这轮对话已经进会话上下文了)
+                    if (isGroup && !adaptiveSynthetic) adaptive.onNormalDispatch(account.accountId, String(groupId));
+
                     await enqueueQQMessageForDispatch(
                         route.sessionKey,
                         { ctxPayload, storePath, executeDispatch, runEpoch: 0 },
@@ -5135,6 +5280,33 @@ ${current}
                 } catch (err) {
                     console.error("[QQ] Critical error in message handler:", err);
                 }
+            };
+            client.on("message", onMessageEvent);
+            // 自适应触发的合成 inbound 入口:重入同一个消息处理器(override 已由
+            // adaptive.evaluate 预先注册,按 message_id 取用),复用全部投递机器。
+            // 注入前等待该群会话空闲:abort/steer 打断模式下,往进行中的正常对话
+            // 里砸合成消息会打断/劣化它(10s 一轮,最多等 5 分钟,超时则照常入队合并)。
+            adaptive.attachInvoker(account.accountId, async (syntheticEvent) => {
+                if (isStaleGeneration()) return;
+                const rt: any = getQQRuntime();
+                for (let i = 0; i < 30; i++) {
+                    try {
+                        const liveCfg = accountConfigs.get(account.accountId) ?? config;
+                        const route = rt.channel.routing.resolveAgentRoute({
+                            cfg: liveCfg,
+                            channel: "qq",
+                            accountId: account.accountId,
+                            peer: { kind: "group", id: String((syntheticEvent as any).group_id ?? "") },
+                        });
+                        const q = sessionQueues.get(route.sessionKey);
+                        if (!q?.isProcessing) break;
+                    } catch {
+                        break; // 解析失败就不等了,交给消息管线的正常闸门
+                    }
+                    await new Promise((r) => setTimeout(r, 10000));
+                    if (isStaleGeneration()) return;
+                }
+                await onMessageEvent(syntheticEvent);
             });
 
             client.connect();

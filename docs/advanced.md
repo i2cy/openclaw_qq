@@ -239,6 +239,22 @@ openclaw setup qq
 | `blockStreaming` | boolean | `true` | 是否按 assistant message 分块发送回复。默认开启；开启后 commentary / final 都可以按消息边界落地。 |
 | `blockStreamingBreak` | string | `message_end` | 分块发送边界。默认 `message_end`，即每条 assistant message 完整后再发；`text_end` 会更碎、更接近逐段流式。 |
 | `commentaryPayloads` | boolean | `true` | 中间轮次评论实时送达:模型在工具调用之间说的可见文本(如"稍等,正在画…")实时发到 QQ。completions 模型(k3 等)的中间文本被核心打上 commentary 签名后不进常规投递管线,插件通过 `onItemEvent` preamble 事件接住并自行发送(唯一受支持出口),同时独占 commentary 所有权、杜绝 verbose 模式下最终回复重复发送。中间文本折叠为单行,`[[tts:text]]` 解包为文字,`MEDIA:` 忽略。关闭则只发回合最终回复。 |
+| `adaptiveGroups` | string | `""` | 自适应触发白名单群号(逗号分隔)。空=关闭。白名单群无需 @/关键词,由判定模型决定是否主动插嘴;仍需同时在 `allowedGroups` 内。 |
+| `adaptiveAdminsOnly` | boolean | `false` | 仅 admins 成员的新消息触发判定(窗口记录范围另由 `adaptiveRecordScope` 控制)。 |
+| `adaptiveRecordScope` | string | `all` | 窗口记录范围:`all`=所有成员;`admins`=仅 admins 名单。 |
+| `adaptiveWindowMaxMessages` | number | `60` | 每群滚动窗口最大条数(超出从最旧淘汰,`adaptiveWindowMinDays` 内受保护,硬顶 `adaptiveWindowHardCap`=300,14 天硬过期)。 |
+| `adaptiveWindowMinDays` | number | `2` | 窗口消息最少保留天数。 |
+| `adaptiveCooldownMs` | number | `120000` | 同群两次判定最小间隔。 |
+| `adaptiveReplyCooldownMs` | number | `600000` | 实际插嘴后的更长冷却,防连环插嘴。 |
+| `adaptiveDebounceMs` | number | `8000` | 判定聚合窗口:连发多条合并为一次判定(以最后一条为触发)。 |
+| `adaptiveJudgeTimeoutMs` | number | `60000` | 判定模型单次调用超时。 |
+| `adaptiveJudgeMaxRetries` | number | `3` | 判定输出解析失败时的带错重试次数。 |
+| `adaptiveJudgeModel` | string | `""` | 判定模型 `provider/model`(凭据取自 `models.providers`)。默认(留空)=`dgx-spark/qwen3.8-flash-next`。每次判定含 ~20k tokens 人格头(SOUL/IDENTITY/USER),建议本地/廉价模型。 |
+| `adaptiveReplyCriteria` | string | `""` | 插嘴判据。留空时首次启用自动引导生成并写入本字段(热更新)+私聊通知第一位 admin。群内 `/adaptive criteria|relearn|status` 管理。 |
+| `adaptiveQuietHours` | string | `23:30-08:00` | 静默时段(本地时间,支持跨午夜),时段内不主动插嘴;@提及照常。留空关闭。 |
+| `adaptiveDryRun` | boolean | `false` | 只判定+写审计日志 `/tmp/qq_adaptive.log`,不注入回复。 |
+| `adaptiveTrace` | boolean | `false` | 详细判定过程日志。 |
+| `adaptiveMaxPerHour` | number | `20` | 每群每小时判定上限(成本护栏)。 |
 | `forwardLongReplyThreshold` | number | `300` | `final_answer` 超过该字符数时自动改用 QQ 合并转发；`commentary` 仍按普通消息发送。默认 `300`。 |
 | `forwardNodeCharLimit` | number | `0` | 长回复合并转发时，每个节点的字符上限。默认 `0` 表示不按长度拆节点，尽量把同一轮回复放进一个转发。 |
 | `forwardNodeName` | string | `OpenClaw` | 长回复合并转发时，节点显示名称。 |
@@ -567,3 +583,31 @@ A: 将 `enableTTS` 设为 `true`。注意：这取决于 OneBot 服务端是否�
 | **风控等级** | 🔴 **极高** | 🟢 **极低** | QQ 极易因回复过快或敏感词封号，插件已内置分片限速。 |
 | **戳一戳** | ✅ **特色支持** | ❌ 不支持 | QQ 特有的社交互动，AI 可感知并回应。 |
 | **转发消息** | ✅ **深度支持** | ❌ 基础支持 | QQ 插件专门优化了对“合并转发”聊天记录的解析。 |
+
+
+## 群聊自适应触发(Adaptive Group Trigger, 2026-09-27)
+
+白名单群里无需 @/关键词,由轻量判定模型(judge)决定 Cody 是否"主动插嘴":
+
+```
+新群消息 → 滚动窗口记录(≥minDays, ≤maxMessages, 持久化, 重启不丢)
+        → 闸门(白名单群/冷却/静默时段/每小时上限/adminsOnly)
+        → debounce 聚合 → judge(SOUL+IDENTITY+USER+判据+窗口上下文 → JSON 判定)
+        → reply=false → 冷却后待命
+        → reply=true  → 选中消息(去重已注入)组合完整上下文(真实图片/回复链/昵称/时间)
+                      → 合成 inbound 重入正常消息管线 → 群 session → 正常回复投递
+```
+
+要点:
+- **@提及/关键词路径完全不受影响**,且插嘴回合同样受 `interruptOnNewMessage` 打断模式约束;
+  注入前会等待该群会话空闲(最多 5 分钟),不打断进行中的正常对话。
+- **REPLYING 期间**窗口继续记录但不判定;回合完成后若有排队的合格消息,按冷却打包再判一次。
+- **去重铁律**:已注入会话的消息永不重复注入;正常路径 dispatch 会把全窗标记为已注入。
+- Cody 自己的群发言镜像入窗(judge 知道她说过什么,防复读);群消息撤回同步清理窗口。
+- judge 失败(网络/格式重试耗尽)静默放弃本轮,冷却照常,绝不阻塞正常消息路径。
+- 判定审计日志:`/tmp/qq_adaptive.log`(每次判定的触发消息/结论/理由/选中序号/注入结果)。
+- 判据引导:首次启用且判据为空时,用判定模型+人格文件生成"想插嘴的情形",写入
+  `channels.qq.adaptiveReplyCriteria`(openclaw.json,原子写+备份)并私聊通知第一位 admin。
+- 管理命令(仅 admin):`/adaptive status` `/adaptive criteria [文本]` `/adaptive relearn`。
+- 注意:白名单群必须同时在 `allowedGroups` 内(若其非空);`adminOnlyChat` 开启的群里
+  非 admin 消息不会触发判定(注入会被管理闸门拦截,直接不判)。
