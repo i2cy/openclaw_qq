@@ -34,7 +34,7 @@ export type AdaptiveWindowEntry = {
     self?: boolean;             // Cody 自己的发言镜像
 };
 
-type WindowFile = { nextSeq: number; entries: AdaptiveWindowEntry[] };
+type WindowFile = { nextSeq: number; entries: AdaptiveWindowEntry[]; lastFramedAt?: number };
 
 type GroupPhase = "idle" | "debounce" | "judging" | "replying";
 
@@ -79,6 +79,7 @@ export type AdaptiveAccountConfig = {
     dryRun: boolean;
     trace: boolean;
     maxPerHour: number;
+    reframeAfterMs: number;      // 距上次完整框架超过此时长 → 重发框架(上下文大概率已轮换/压缩)
     notifyUser: string;          // 引导完成通知对象(第一个 admin)
     adminOnlyChat: boolean;      // 该模式下非 admin 触发的注入会被正常路径拦掉,直接不触发
     selfId: string;
@@ -234,6 +235,7 @@ export function adaptiveConfigure(accountId: string, raw: Record<string, any>, o
         dryRun: Boolean(raw.adaptiveDryRun),
         trace: Boolean(raw.adaptiveTrace),
         maxPerHour: Math.max(1, Number(raw.adaptiveMaxPerHour ?? 20)),
+        reframeAfterMs: Math.max(600000, Number(raw.adaptiveReframeAfterMs ?? 6 * 3600 * 1000)),
         notifyUser: String(raw.adaptiveNotifyUser ?? "").trim() || adminIds[0] || "",
         adminOnlyChat: Boolean(raw.adminOnlyChat),
         get selfId() { return String(opts.selfIdGetter() ?? ""); },
@@ -381,6 +383,14 @@ export function onRecall(accountId: string, groupId: string, messageId: string) 
         persistWindow(key);
         alog(`recall removed window entry group=${groupId} msg=${messageId}`);
     }
+}
+
+/** /newsession 等会话替换:上下文清空了,下次注入需要重发完整框架。 */
+export function onSessionReplaced(accountId: string, groupId: string) {
+    if (!isAdaptiveGroup(accountId, groupId)) return;
+    const wf = loadWindow(gkey(accountId, String(groupId)));
+    wf.lastFramedAt = 0;
+    persistWindow(gkey(accountId, String(groupId)));
 }
 
 /** 正常路径(@/关键词/命令)dispatch:窗口全部标记 injected 并取消待判定。 */
@@ -891,16 +901,33 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
             if (mediaEntries.length < 5) mediaEntries.push({ url: "", path: m.path, type: m.type });
         }
     }
-    const contextBlock = [
-        "<group_interjection>",
-        `你正在这个群里潜水,刚看完大家聊的内容,想插个嘴——${reason || "就是想搭句话"}。`,
-        "最近的消息(本地时间,括号里是发送人QQ号):",
-        ctxLines,
-        mediaEntries.length ? `(其中有 ${mediaEntries.length} 张图片,已随本条消息附给你)` : "",
-        "(用你平时的声音和分寸说就好,简短自然;真到嘴边又不想说了,NO_REPLY 收住也完全没问题。别把这段提示本身说出去。)",
-        "</group_interjection>",
-        "",
-    ].filter(Boolean).join("\n");
+    // 制度框架只进上下文一次:距上次完整框架在 reframeAfterMs 内 → 之后每次
+    // 注入只带一行"心情"+消息列表(dad 2026-09-27:重复的制度解释臃肿且让
+    // 回复变冷)。上下文轮换/压缩由时间阈值兜底,/newsession 由钩子即时清零。
+    const needFrame = !wf.lastFramedAt || nowMs() - wf.lastFramedAt > cfg.reframeAfterMs;
+    const contextBlock = needFrame
+        ? [
+            "<group_interjection>",
+            `你正在这个群里潜水,刚看完大家聊的内容,想插个嘴——${reason || "就是想搭句话"}。`,
+            "最近的消息(本地时间,括号里是发送人QQ号):",
+            ctxLines,
+            mediaEntries.length ? `(其中有 ${mediaEntries.length} 张图片,已随本条消息附给你)` : "",
+            "(用你平时的声音和分寸说就好,简短自然;真到嘴边又不想说了,NO_REPLY 收住也完全没问题。别把这段提示本身说出去。)",
+            "</group_interjection>",
+            "",
+        ].filter(Boolean).join("\n")
+        : [
+            "<group_interjection>",
+            `你又想接话了——${reason || "就是想搭句话"}`,
+            ctxLines,
+            mediaEntries.length ? `(图片 ${mediaEntries.length} 张已附上)` : "",
+            "</group_interjection>",
+            "",
+        ].filter(Boolean).join("\n");
+    if (needFrame) {
+        wf.lastFramedAt = nowMs();
+        persistWindow(key);
+    }
 
     const syntheticId = `adaptive-${nowMs()}-${Math.floor(Math.random() * 1e4)}`;
     const markerText = `[主动插嘴 #${trigger.seq}]`;
@@ -923,7 +950,7 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
 
     st.phase = "replying";
     st.replyingSince = nowMs();
-    alog(`group=${groupId} INJECT seqs=[${selected.map((e) => e.seq).join(",")}] media=${mediaEntries.length} syntheticId=${syntheticId} triggerUser=${trigger.userId}`);
+    alog(`group=${groupId} INJECT seqs=[${selected.map((e) => e.seq).join(",")}] media=${mediaEntries.length} framed=${needFrame} syntheticId=${syntheticId} triggerUser=${trigger.userId}`);
     try {
         await invoker(event, { contextBlock, mediaEntries, syntheticId });
     } catch (e: any) {

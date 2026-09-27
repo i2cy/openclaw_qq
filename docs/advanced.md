@@ -252,6 +252,7 @@ openclaw setup qq
 | `adaptiveJudgeModel` | string | `""` | 判定模型 `provider/model`(凭据取自 `models.providers`)。默认(留空)=`dgx-spark/qwen3.8-flash-next`。每次判定含 ~20k tokens 人格头(SOUL/IDENTITY/USER),建议本地/廉价模型。 |
 | `adaptiveReplyCriteria` | string | `""` | 插嘴判据。留空时首次启用自动引导生成并写入本字段(热更新)+私聊通知第一位 admin。群内 `/adaptive criteria|relearn|status` 管理。 |
 | `adaptiveQuietHours` | string | `23:30-08:00` | 静默时段(本地时间,支持跨午夜),时段内不主动插嘴;@提及照常。留空关闭。 |
+| `adaptiveReframeAfterMs` | number | `21600000` | 注入框架重发间隔:完整制度框架每个会话上下文只发一次,之后注入只带一行心情+消息列表;超过此时长(默认 6h,上下文大概率已轮换/压缩)才重发。`/newsession` 立即重置。 |
 | `adaptiveDryRun` | boolean | `false` | 只判定+写审计日志 `/tmp/qq_adaptive.log`,不注入回复。 |
 | `adaptiveTrace` | boolean | `false` | 详细判定过程日志。 |
 | `adaptiveMaxPerHour` | number | `20` | 每群每小时判定上限(成本护栏)。 |

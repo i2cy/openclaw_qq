@@ -137,6 +137,7 @@ export const QQConfigSchema = z.object({
   adaptiveDryRun: BooleanInputSchema(false).describe("只判定+写审计日志(/tmp/qq_adaptive.log),不真正注入回复。调教判据期神器。默认关闭。"),
   adaptiveTrace: BooleanInputSchema(false).describe("输出详细判定过程日志(冷却跳过/排队/窗口变化等)。默认关闭。"),
   adaptiveMaxPerHour: NumberInputSchema(20).describe("每群每小时判定次数上限(成本护栏)。默认 20。"),
+  adaptiveReframeAfterMs: NumberInputSchema(21600000).describe("注入框架重发间隔(毫秒):完整制度框架每个会话上下文只发一次,之后注入只带一行心情+消息列表;距上次完整框架超过此值(默认 6 小时,上下文大概率已轮换/压缩)才重发框架。/newsession 会立即重置。"),
   adaptiveNotifyUser: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("自适应功能的私聊通知对象(判据引导完成等)。留空=admins 名单第一位。"),
   maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),
   maxForwardLayers: NumberInputSchema(5).describe("forward 最大递归层数。默认 5。"),

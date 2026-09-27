@@ -4051,6 +4051,8 @@ ${current}
                                 sessionKey: routeForReset.sessionKey,
                             }).storePath;
                             const resetOk = await resetSessionByKey(storePath, routeForReset.sessionKey);
+                            // 会话被替换 → 上下文清空,下次自适应注入需重发完整框架
+                            if (isGroup) adaptive.onSessionReplaced(account.accountId, String(groupId));
                             const notice = resetOk
                                 ? "✅ 当前会话已重置。请继续发送你的问题。"
                                 : "ℹ️ 当前会话本就为空，已为你准备新会话。";
