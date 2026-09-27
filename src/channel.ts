@@ -4199,8 +4199,11 @@ ${current}
                         } catch { }
                     }
 
+                    // 自适应触发的合成事件:窗口上下文块已含群聊近况,跳过 NapCat
+                    // history(否则同一批消息注入两遍,白烧 tokens 还稀释语气)
+                    const adaptiveSynthetic = isGroup && adaptive.isSynthetic(event.message_id);
                     let historyContext = "";
-                    if (isGroup && config.historyLimit !== 0) {
+                    if (isGroup && config.historyLimit !== 0 && !adaptiveSynthetic) {
                         try {
                             const history = await client.getGroupMsgHistory(groupId);
                             if (history?.messages) {
@@ -4211,8 +4214,8 @@ ${current}
                     }
 
                     // ── 自适应群聊触发:白名单群消息先进滚动窗口(所有路径都记录,
-                    // 含稍后走正常 dispatch 的消息,保持 judge 上下文连续) ──
-                    const adaptiveSynthetic = isGroup && adaptive.isSynthetic(event.message_id);
+                    // 含稍后走正常 dispatch 的消息,保持 judge 上下文连续;
+                    // adaptiveSynthetic 已在 historyContext 之前判定) ──
                     let adaptiveEntry: adaptive.AdaptiveWindowEntry | null = null;
                     if (isGroup && !adaptiveSynthetic && adaptive.isAdaptiveGroup(account.accountId, String(groupId))) {
                         adaptiveEntry = adaptive.recordGroupMessage({

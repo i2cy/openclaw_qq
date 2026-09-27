@@ -815,7 +815,8 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
             criteria,
             "",
             "【硬性规则】",
-            '- 只输出一个 JSON 对象: {"reply":true或false,"reason":"一句话理由","messageIds":[注入上下文用的消息序号]}',
+            '- 只输出一个 JSON 对象: {"reply":true或false,"reason":"...","messageIds":[注入上下文用的消息序号]}',
+            '- reason 用 Cody 第一人称口语写(这句会原样变成回复模型"想说话的心情"),例如"老爸在聊我熟的量化,我想补一句";不要公文腔/判定器腔',
             `- messageIds 必须包含触发消息序号 #${trigger.seq},可另外挑选与本次话题直接相关的少量消息`,
             "- 标注 (我(Cody)) 的行是你自己说过的话:内容已被回应过就不要再接,防止复读",
             "- 其他机器人/系统消息不作为回复对象",
@@ -873,14 +874,15 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
     const invoker = invokers.get(accountId);
     if (!invoker) { st.phase = "idle"; alog(`group=${groupId} no invoker attached; abort injection`); return; }
 
-    // 组装上下文块 + 媒体
-    const d0 = new Date();
+    // 组装上下文块 + 媒体。框架话术刻意用"她自己的内心声音"而非制度腔:
+    // 合规指令式的前言会把模型推进冷冰冰的播报腔(dad 2026-09-27 实测反馈),
+    // 群聊细则人格文件里本来就有,不重复提醒。
     const ctxLines = selected.map((e) => {
         const d = new Date(e.ts);
-        const hh = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
-        const who = e.self ? "我自己" : `${e.nickname}(QQ:${e.userId})`;
-        const reply = e.replyToSeq ? ` (回复 #${e.replyToSeq})` : "";
-        const img = e.imageCount && !(e.media?.length) ? ` [图片×${e.imageCount}(未缓存)]` : "";
+        const hh = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+        const who = e.self ? "我自己" : `${e.nickname}(${e.userId})`;
+        const reply = e.replyToSeq ? ` (回复#${e.replyToSeq})` : "";
+        const img = e.imageCount && !(e.media?.length) ? ` [图片×${e.imageCount}]` : "";
         return `#${e.seq} [${hh}] ${who}${reply}: ${e.text}${img}`;
     }).join("\n");
     const mediaEntries: AdaptiveOverride["mediaEntries"] = [];
@@ -890,18 +892,18 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
         }
     }
     const contextBlock = [
-        "<adaptive_context>",
-        "[主动插嘴触发] 你(判定器)根据人格与判据决定参与这个群聊。以下是选中注入的消息上下文(本地时间,含发送人QQ号):",
-        `判定理由: ${reason || "(未提供)"}`,
+        "<group_interjection>",
+        `你正在这个群里潜水,刚看完大家聊的内容,想插个嘴——${reason || "就是想搭句话"}。`,
+        "最近的消息(本地时间,括号里是发送人QQ号):",
         ctxLines,
-        mediaEntries.length ? `(附带 ${mediaEntries.length} 张选中消息的图片,已作为媒体附加)` : "",
-        "要求: 以群聊分寸回应(公共场合守则);看完上下文若觉得其实不需要回复,直接以 NO_REPLY 结束,不要硬凑。",
-        "</adaptive_context>",
+        mediaEntries.length ? `(其中有 ${mediaEntries.length} 张图片,已随本条消息附给你)` : "",
+        "(用你平时的声音和分寸说就好,简短自然;真到嘴边又不想说了,NO_REPLY 收住也完全没问题。别把这段提示本身说出去。)",
+        "</group_interjection>",
         "",
     ].filter(Boolean).join("\n");
 
     const syntheticId = `adaptive-${nowMs()}-${Math.floor(Math.random() * 1e4)}`;
-    const markerText = `【主动插嘴】(adaptive trigger #${trigger.seq} @ ${d0.toLocaleTimeString("zh-CN", { hour12: false })})`;
+    const markerText = `[主动插嘴 #${trigger.seq}]`;
     const event: OneBotEvent = {
         time: Math.floor(nowMs() / 1000),
         self_id: Number(cfg.selfId) || 0,
