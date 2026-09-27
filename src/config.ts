@@ -131,7 +131,7 @@ export const QQConfigSchema = z.object({
   adaptiveDebounceMs: NumberInputSchema(8000).describe("触发判定的聚合窗口(毫秒):短时间连发多条消息合并为一次判定,以最后一条为触发消息。默认 8000。"),
   adaptiveJudgeTimeoutMs: NumberInputSchema(60000).describe("判定模型单次调用超时(毫秒)。默认 60000。"),
   adaptiveJudgeMaxRetries: NumberInputSchema(3).describe("判定输出解析失败时的带错重试次数。默认 3;全部失败则本轮放弃(冷却照常)。"),
-  adaptiveJudgeModel: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("判定模型,格式 provider/model,凭据取自 models.providers。默认(留空)=dgx-spark/qwen3.8-flash-next(本地免费)。人格头 ~20k tokens,建议本地/廉价模型。"),
+  adaptiveJudgeModel: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("判定模型,格式 provider/model,凭据取自 models.providers。留空(默认)=跟随 openclaw.json 的 agents.defaults.model:primary 优先、fallbacks 依序候补(网络类失败自动切换,每次判定时现读配置,主模型热切换即时生效)。人格头 ~20k tokens,建议本地/廉价模型。"),
   adaptiveReplyCriteria: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("插嘴判据文本。留空时首次启用会自动引导:用判定模型+人格文件生成'你想插嘴的情形'并写入本字段(热更新),同时私聊通知第一位 admin。"),
   adaptiveQuietHours: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("23:30-08:00")).describe("自适应触发静默时段(本地时间 HH:MM-HH:MM,支持跨午夜)。时段内不主动插嘴;@提及/关键词照常即时回复。默认 23:30-08:00,留空关闭。"),
   adaptiveDryRun: BooleanInputSchema(false).describe("只判定+写审计日志(/tmp/qq_adaptive.log),不真正注入回复。调教判据期神器。默认关闭。"),

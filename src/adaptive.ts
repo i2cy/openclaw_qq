@@ -227,7 +227,7 @@ export function adaptiveConfigure(accountId: string, raw: Record<string, any>, o
         debounceMs: Math.max(1000, Number(raw.adaptiveDebounceMs ?? 8000)),
         judgeTimeoutMs: Math.max(5000, Number(raw.adaptiveJudgeTimeoutMs ?? 60000)),
         judgeMaxRetries: Math.max(0, Number(raw.adaptiveJudgeMaxRetries ?? 3)),
-        judgeModel: String(raw.adaptiveJudgeModel ?? "").trim() || DEFAULT_JUDGE_MODEL,
+        judgeModel: String(raw.adaptiveJudgeModel ?? "").trim(), // 空 = 跟随 agents.defaults.model(primary→fallbacks)
         criteria: String(raw.adaptiveReplyCriteria ?? "").trim(),
         quietStart: quiet?.start ?? null,
         quietEnd: quiet?.end ?? null,
@@ -239,7 +239,7 @@ export function adaptiveConfigure(accountId: string, raw: Record<string, any>, o
         get selfId() { return String(opts.selfIdGetter() ?? ""); },
     } as AdaptiveAccountConfig;
     configs.set(accountId, cfg);
-    if (cfg.enabled) alog(`configured account=${accountId} groups=[${[...cfg.groups].join(",")}] judge=${cfg.judgeModel} dryRun=${cfg.dryRun} adminsOnly=${cfg.adminsOnly} quiet=${cfg.quietStart ?? "-"}-${cfg.quietEnd ?? "-"}`);
+    if (cfg.enabled) alog(`configured account=${accountId} groups=[${[...cfg.groups].join(",")}] judge=${resolveJudgeChain(cfg.judgeModel).join(" → ")} dryRun=${cfg.dryRun} adminsOnly=${cfg.adminsOnly} quiet=${cfg.quietStart ?? "-"}-${cfg.quietEnd ?? "-"}`);
     return cfg;
 }
 
@@ -543,7 +543,31 @@ function readOpenClawConfigFile(): { file: string; data: any } | null {
     return null;
 }
 
-type JudgeEndpoint = { url: string; apiKey: string; model: string };
+type JudgeEndpoint = { url: string; apiKey: string; model: string; ref: string };
+
+/**
+ * 判定模型链:
+ * - adaptiveJudgeModel 显式配置 → 只用它;
+ * - 留空(默认)→ 跟随 openclaw.json 的 agents.defaults.model:primary 优先,
+ *   fallbacks 依序候补(网络类失败自动切下一个);都拿不到才用硬编码兜底。
+ * 每次调用时现读配置文件,主模型热切换后无需重启插件。
+ */
+function resolveJudgeChain(explicit: string): string[] {
+    const trimmed = String(explicit ?? "").trim();
+    if (trimmed) return [trimmed];
+    const found = readOpenClawConfigFile();
+    const m = found?.data?.agents?.defaults?.model;
+    const chain: string[] = [];
+    if (typeof m === "string" && m.includes("/")) chain.push(m);
+    else if (m && typeof m === "object") {
+        if (typeof m.primary === "string" && m.primary.includes("/")) chain.push(m.primary);
+        if (Array.isArray(m.fallbacks)) {
+            for (const f of m.fallbacks) if (typeof f === "string" && f.includes("/") && !chain.includes(f)) chain.push(f);
+        }
+    }
+    if (chain.length === 0) chain.push(DEFAULT_JUDGE_MODEL);
+    return chain;
+}
 
 function resolveJudgeEndpoint(judgeModel: string): JudgeEndpoint | null {
     const slash = judgeModel.indexOf("/");
@@ -556,7 +580,7 @@ function resolveJudgeEndpoint(judgeModel: string): JudgeEndpoint | null {
     const baseUrl = String(provider?.baseUrl ?? "").replace(/\/+$/, "");
     if (!baseUrl) return null;
     const url = /\/v\d+$/.test(baseUrl) ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
-    return { url, apiKey: String(provider?.apiKey ?? ""), model };
+    return { url, apiKey: String(provider?.apiKey ?? ""), model, ref: judgeModel };
 }
 
 type ChatMessage = { role: string; content: string };
@@ -694,32 +718,53 @@ function extractJson(raw: string): any {
     return JSON.parse(text);
 }
 
-async function judgeWithRetries(ep: JudgeEndpoint, messages: ChatMessage[], cfg: AdaptiveAccountConfig): Promise<any> {
-    let convo = [...messages];
-    let lastErr = "";
-    for (let attempt = 0; attempt <= cfg.judgeMaxRetries; attempt++) {
-        let out: string;
-        try {
-            out = await chatOnce(ep, convo, cfg.judgeTimeoutMs);
-        } catch (e: any) {
-            // 网络/HTTP 错误:不重试(冷却兜底),直接抛出
-            throw new Error(`judge call failed: ${String(e?.message ?? e)}`);
+const NETWORKISH_JUDGE_ERROR = /fetch failed|ECONN|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|timeout|aborted|socket|empty content|only reasoning/i;
+
+/**
+ * 带候补链的判定调用:每个候选模型内部做解析重试(带错误反馈),
+ * 网络类失败(拒连/超时/空响应)自动切换下一个候选。
+ * 返回 { parsed, used } — used 为实际命中的 "provider/model"。
+ */
+async function callJudgeChain(
+    messages: ChatMessage[],
+    cfg: AdaptiveAccountConfig,
+    validate: (parsed: any) => void,
+    opts?: { timeoutMs?: number },
+): Promise<{ parsed: any; used: string }> {
+    const chain = resolveJudgeChain(cfg.judgeModel);
+    const timeoutMs = opts?.timeoutMs ?? cfg.judgeTimeoutMs;
+    let lastNetErr = "";
+    for (const cand of chain) {
+        const ep = resolveJudgeEndpoint(cand);
+        if (!ep) { lastNetErr = `cannot resolve endpoint for "${cand}" (models.providers entry missing?)`; continue; }
+        let convo = [...messages];
+        let parseErr = "";
+        for (let attempt = 0; attempt <= cfg.judgeMaxRetries; attempt++) {
+            let out: string;
+            try {
+                out = await chatOnce(ep, convo, timeoutMs);
+            } catch (e: any) {
+                const msg = String(e?.message ?? e);
+                if (NETWORKISH_JUDGE_ERROR.test(msg)) { lastNetErr = `${cand}: ${msg.slice(0, 160)}`; parseErr = ""; break; }
+                throw new Error(`judge call failed (${cand}): ${msg.slice(0, 200)}`);
+            }
+            try {
+                const parsed = extractJson(out);
+                validate(parsed);
+                return { parsed, used: cand };
+            } catch (e: any) {
+                parseErr = String(e?.message ?? e);
+                if (attempt >= cfg.judgeMaxRetries) break;
+                convo = [...convo,
+                    { role: "assistant", content: out.slice(0, 2000) },
+                    { role: "user", content: `你的输出解析失败: ${parseErr}。请严格重新输出合法 JSON，不要输出任何其他文本。` },
+                ];
+            }
         }
-        try {
-            const parsed = extractJson(out);
-            if (typeof parsed?.reply !== "boolean") throw new Error("field `reply` must be boolean");
-            if (parsed.messageIds !== undefined && !Array.isArray(parsed.messageIds)) throw new Error("field `messageIds` must be an array of numbers");
-            return parsed;
-        } catch (e: any) {
-            lastErr = String(e?.message ?? e);
-            if (attempt >= cfg.judgeMaxRetries) break;
-            convo = [...convo, { role: "assistant", content: out.slice(0, 2000) }, {
-                role: "user",
-                content: `你的输出解析失败: ${lastErr}。请严格重新输出合法 JSON: {"reply":true|false,"reason":"...","messageIds":[...]}，不要输出任何其他文本。`,
-            }];
-        }
+        if (parseErr) throw new Error(`judge output unparseable after ${cfg.judgeMaxRetries + 1} attempts (${cand}): ${parseErr}`);
+        // 网络类失败 → 换下一个候选
     }
-    throw new Error(`judge output unparseable after ${cfg.judgeMaxRetries + 1} attempts: ${lastErr}`);
+    throw new Error(`judge unavailable for all candidates [${chain.join(" → ")}]: ${lastNetErr}`);
 }
 
 // ───────────────────────── evaluate ─────────────────────────
@@ -754,11 +799,10 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
     st.lastEvalAt = nowMs();
 
     let verdict: any = null;
+    let usedModel = "";
     judgeInFlight++;
     const startedAt = nowMs();
     try {
-        const ep = resolveJudgeEndpoint(cfg.judgeModel);
-        if (!ep) throw new Error(`cannot resolve judge endpoint for "${cfg.judgeModel}" (check models.providers in openclaw.json)`);
         const criteria = cfg.criteria || readBootstrappedCriteria() || "(判据尚未生成:按人格常识判断,宁可不回复)";
         const lines = wf.entries.map((e) => fmtWindowLine(e, cfg)).join("\n");
         const sys = [
@@ -779,10 +823,15 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
             "- 拿不准就 reply=false;冷却后还有机会",
         ].join("\n");
         const usr = `【群 ${groupId} 近期上下文(共${wf.entries.length}条,时间为本地时间)】\n${lines}\n\n【触发消息】#${trigger.seq}\n请输出 JSON 判定。`;
-        verdict = await judgeWithRetries(ep, [
+        const judged = await callJudgeChain([
             { role: "system", content: sys },
             { role: "user", content: usr },
-        ], cfg);
+        ], cfg, (p) => {
+            if (typeof p?.reply !== "boolean") throw new Error('field "reply" must be boolean');
+            if (p.messageIds !== undefined && !Array.isArray(p.messageIds)) throw new Error('field "messageIds" must be an array of numbers');
+        });
+        verdict = judged.parsed;
+        usedModel = judged.used;
     } catch (e: any) {
         st.phase = "idle";
         alog(`group=${groupId} trigger=#${triggerSeq} judge FAILED (${nowMs() - startedAt}ms): ${String(e?.message ?? e).slice(0, 200)}`);
@@ -796,7 +845,7 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
     const requested: number[] = Array.isArray(verdict.messageIds)
         ? verdict.messageIds.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n))
         : [];
-    alog(`group=${groupId} trigger=#${triggerSeq} verdict=${reply ? "REPLY" : "skip"} reason="${reason}" requested=[${requested.join(",")}] (${nowMs() - startedAt}ms)${cfg.dryRun ? " [dryRun]" : ""}`);
+    alog(`group=${groupId} trigger=#${triggerSeq} verdict=${reply ? "REPLY" : "skip"} model=${usedModel} reason="${reason}" requested=[${requested.join(",")}] (${nowMs() - startedAt}ms)${cfg.dryRun ? " [dryRun]" : ""}`);
 
     if (!reply) { st.phase = "idle"; return; }
 
@@ -939,8 +988,6 @@ export async function bootstrapCriteriaIfNeeded(accountId: string) {
     if (bootstrapInFlight) return;
     bootstrapInFlight = true;
     try {
-        const ep = resolveJudgeEndpoint(cfg.judgeModel);
-        if (!ep) { alog("criteria bootstrap skipped: judge endpoint unresolvable"); return; }
         const sys = [
             "你是 Cody。以下是你的人格文件和联系人列表。",
             loadPersona(),
@@ -948,23 +995,14 @@ export async function bootstrapCriteriaIfNeeded(accountId: string) {
             "任务: 为 QQ 群聊'主动插嘴'功能生成你的参与判据。列出你想要回复/插嘴的具体情形(以及明确不想插嘴的情形),用第一人称、可执行、10-20 条,尊重人格文件里的公共场合守则(隐私、分寸、不 NSFW)。",
             '只输出 JSON: {"criteria":["情形1","情形2",...],"notCriteria":["不插嘴的情形1",...]}',
         ].join("\n");
-        // 瞬时网络抖动不烧引导预算:会话内小重试
-        let out = "";
-        for (let netTry = 0; ; netTry++) {
-            try {
-                out = await chatOnce(ep, [
-                    { role: "system", content: sys },
-                    { role: "user", content: "请生成判据 JSON。" },
-                ], Math.max(cfg.judgeTimeoutMs, 120000));
-                break;
-            } catch (e: any) {
-                const msg = String(e?.message ?? e);
-                if (netTry >= 2 || !/fetch failed|ECONN|timeout|aborted|socket/i.test(msg)) throw e;
-                alog(`criteria bootstrap transient network error (retry ${netTry + 1}/2): ${msg.slice(0, 120)}`);
-                await new Promise((r) => setTimeout(r, 5000));
-            }
-        }
-        const parsed = extractJson(out);
+        // callJudgeChain 自带候补链(网络失败自动换下一个模型)+解析带错重试
+        const boot = await callJudgeChain([
+            { role: "system", content: sys },
+            { role: "user", content: "请生成判据 JSON。" },
+        ], cfg, (p) => {
+            if (!Array.isArray(p?.criteria) || p.criteria.length === 0) throw new Error('field "criteria" must be a non-empty array');
+        }, { timeoutMs: Math.max(cfg.judgeTimeoutMs, 120000) });
+        const parsed = boot.parsed;
         const want = Array.isArray(parsed?.criteria) ? parsed.criteria.map((s: any) => String(s).trim()).filter(Boolean) : [];
         const not = Array.isArray(parsed?.notCriteria) ? parsed.notCriteria.map((s: any) => String(s).trim()).filter(Boolean) : [];
         if (want.length === 0) throw new Error("bootstrap produced no criteria");
@@ -983,7 +1021,7 @@ export async function bootstrapCriteriaIfNeeded(accountId: string) {
             ...written ? {} : { criteriaText: text },
         });
         cfg.criteria = written ? "" : text; // 写进配置后走热更新;失败则用内存/存档兜底
-        alog(`criteria bootstrapped via ${cfg.judgeModel}: ${want.length} want + ${not.length} not; configWritten=${written}`);
+        alog(`criteria bootstrapped via ${boot.used}: ${want.length} want + ${not.length} not; configWritten=${written}`);
         if (written && cfg.notifyUser) {
             try {
                 senders.get(accountId)?.sendPrivate(cfg.notifyUser,
@@ -1019,7 +1057,7 @@ export function adaptiveStatus(accountId: string, groupId?: string): string {
     if (!cfg) return "adaptive: 未配置";
     const lines: string[] = [
         `🧠 adaptive: ${cfg.enabled ? "ON" : "OFF"} groups=[${[...cfg.groups].join(",") || "-"}] dryRun=${cfg.dryRun}`,
-        `judge=${cfg.judgeModel} cooldown=${Math.round(cfg.cooldownMs / 1000)}s replyCooldown=${Math.round(cfg.replyCooldownMs / 1000)}s quiet=${cfg.quietStart ?? "-"}~${cfg.quietEnd ?? "-"} adminsOnly=${cfg.adminsOnly} record=${cfg.recordScope}`,
+        `judge=${resolveJudgeChain(cfg.judgeModel).join(" → ")} cooldown=${Math.round(cfg.cooldownMs / 1000)}s replyCooldown=${Math.round(cfg.replyCooldownMs / 1000)}s quiet=${cfg.quietStart ?? "-"}~${cfg.quietEnd ?? "-"} adminsOnly=${cfg.adminsOnly} record=${cfg.recordScope}`,
         `criteria: ${cfg.criteria ? `${cfg.criteria.length} chars (config)` : readBootstrappedCriteria() ? `${readBootstrappedCriteria().length} chars (bootstrap)` : "(未生成)"}`,
     ];
     const keys = groupId ? [gkey(accountId, String(groupId))] : [...windows.keys()].filter((k) => k.startsWith(accountId + ":")).slice(0, 8);
