@@ -14,6 +14,7 @@
 // - judge 失败(网络/格式重试耗尽): 静默放弃本轮,绝不阻塞正常路径
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { OneBotEvent } from "./types.js";
 
 // ───────────────────────── types ─────────────────────────
@@ -34,7 +35,13 @@ export type AdaptiveWindowEntry = {
     self?: boolean;             // Cody 自己的发言镜像
 };
 
-type WindowFile = { nextSeq: number; entries: AdaptiveWindowEntry[]; lastFramedAt?: number };
+type WindowFile = {
+    nextSeq: number;
+    entries: AdaptiveWindowEntry[];
+    lastFramedAt?: number;
+    lastFramedCompaction?: number;   // 框架发送时会话的 compactionCount 快照
+    injectionsSinceFrame?: number;   // 距上次完整框架的 slim 注入次数
+};
 
 type GroupPhase = "idle" | "debounce" | "judging" | "replying";
 
@@ -51,6 +58,30 @@ type GroupState = {
 };
 
 const REPLYING_WATCHDOG_MS = 15 * 60 * 1000;
+
+/**
+ * 只读探测群会话的 compactionCount(session_nodes.entry_json)。
+ * 注入是低频事件,现场开一次只读连接代价可忽略;任何异常返回 null
+ * (降级到 时间阈值+每N次 兜底,绝不影响注入本身)。
+ */
+function readCompactionCount(sessionKey: string): number | null {
+    try {
+        const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME || "/tmp", ".openclaw");
+        const dbPath = path.join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite");
+        if (!fs.existsSync(dbPath)) return null;
+        const db = new DatabaseSync(dbPath, { readOnly: true });
+        try {
+            const row = db.prepare("select entry_json from session_nodes where session_key = ?").get(sessionKey) as any;
+            if (!row?.entry_json) return 0; // 会话节点还没建 → 视作 0 次压缩
+            const entry = JSON.parse(row.entry_json);
+            return Number(entry?.compactionCount ?? 0) || 0;
+        } finally {
+            db.close();
+        }
+    } catch {
+        return null;
+    }
+}
 
 export type AdaptiveOverride = {
     contextBlock: string;
@@ -80,6 +111,7 @@ export type AdaptiveAccountConfig = {
     trace: boolean;
     maxPerHour: number;
     reframeAfterMs: number;      // 距上次完整框架超过此时长 → 重发框架(上下文大概率已轮换/压缩)
+    reframeEveryN: number;       // 每 N 次 slim 注入强制重发一次完整框架(兜底)
     notifyUser: string;          // 引导完成通知对象(第一个 admin)
     adminOnlyChat: boolean;      // 该模式下非 admin 触发的注入会被正常路径拦掉,直接不触发
     selfId: string;
@@ -235,7 +267,8 @@ export function adaptiveConfigure(accountId: string, raw: Record<string, any>, o
         dryRun: Boolean(raw.adaptiveDryRun),
         trace: Boolean(raw.adaptiveTrace),
         maxPerHour: Math.max(1, Number(raw.adaptiveMaxPerHour ?? 20)),
-        reframeAfterMs: Math.max(600000, Number(raw.adaptiveReframeAfterMs ?? 6 * 3600 * 1000)),
+        reframeAfterMs: Math.max(600000, Number(raw.adaptiveReframeAfterMs ?? 24 * 3600 * 1000)),
+        reframeEveryN: Math.max(1, Number(raw.adaptiveReframeEveryN ?? 8)),
         notifyUser: String(raw.adaptiveNotifyUser ?? "").trim() || adminIds[0] || "",
         adminOnlyChat: Boolean(raw.adminOnlyChat),
         get selfId() { return String(opts.selfIdGetter() ?? ""); },
@@ -901,10 +934,19 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
             if (mediaEntries.length < 5) mediaEntries.push({ url: "", path: m.path, type: m.type });
         }
     }
-    // 制度框架只进上下文一次:距上次完整框架在 reframeAfterMs 内 → 之后每次
-    // 注入只带一行"心情"+消息列表(dad 2026-09-27:重复的制度解释臃肿且让
-    // 回复变冷)。上下文轮换/压缩由时间阈值兜底,/newsession 由钩子即时清零。
-    const needFrame = !wf.lastFramedAt || nowMs() - wf.lastFramedAt > cfg.reframeAfterMs;
+    // 制度框架保留策略(dad 2026-09-27):
+    // - 至少一天一次完整制度提醒(reframeAfterMs,默认 24h)
+    // - 同一会话上下文里始终至少保留一次提醒 → 实测 compactionCount,
+    //   会话被压缩(框架大概率被摘要吃掉)立即重发;/newsession 走钩子即时清零
+    // - 每 reframeEveryN 次 slim 注入强制重发一次(探测失败时的兜底)
+    // 其余注入只带一行"心情"+消息列表(重复制度解释臃肿且让回复变冷)。
+    const compactionNow = readCompactionCount(`agent:main:qq:group:${groupId}`);
+    const compactionChanged = compactionNow != null && wf.lastFramedCompaction != null && compactionNow !== wf.lastFramedCompaction;
+    const sinceFrame = wf.injectionsSinceFrame ?? 0;
+    const needFrame = !wf.lastFramedAt
+        || nowMs() - wf.lastFramedAt > cfg.reframeAfterMs
+        || compactionChanged
+        || (cfg.reframeEveryN > 0 && sinceFrame >= cfg.reframeEveryN);
     const contextBlock = needFrame
         ? [
             "<group_interjection>",
@@ -918,16 +960,22 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
         ].filter(Boolean).join("\n")
         : [
             "<group_interjection>",
-            `你又想接话了——${reason || "就是想搭句话"}`,
+            `你想接这个话——${reason || "就是想搭句话"}`,
             ctxLines,
             mediaEntries.length ? `(图片 ${mediaEntries.length} 张已附上)` : "",
             "</group_interjection>",
             "",
         ].filter(Boolean).join("\n");
     if (needFrame) {
+        const firstFrame = !wf.lastFramedAt;
         wf.lastFramedAt = nowMs();
-        persistWindow(key);
+        wf.injectionsSinceFrame = 0;
+        alog(`group=${groupId} frame policy: FULL frame (first=${firstFrame} compactionChanged=${compactionChanged} sinceFrame=${sinceFrame})`);
+    } else {
+        wf.injectionsSinceFrame = sinceFrame + 1;
     }
+    if (compactionNow != null) wf.lastFramedCompaction = compactionNow;
+    persistWindow(key);
 
     const syntheticId = `adaptive-${nowMs()}-${Math.floor(Math.random() * 1e4)}`;
     const markerText = `[主动插嘴 #${trigger.seq}]`;
