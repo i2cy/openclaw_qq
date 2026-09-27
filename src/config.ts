@@ -137,6 +137,7 @@ export const QQConfigSchema = z.object({
   adaptiveDryRun: BooleanInputSchema(false).describe("只判定+写审计日志(/tmp/qq_adaptive.log),不真正注入回复。调教判据期神器。默认关闭。"),
   adaptiveTrace: BooleanInputSchema(false).describe("输出详细判定过程日志(冷却跳过/排队/窗口变化等)。默认关闭。"),
   adaptiveMaxPerHour: NumberInputSchema(20).describe("每群每小时判定次数上限(成本护栏)。默认 20。"),
+  adaptiveNotifyUser: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("自适应功能的私聊通知对象(判据引导完成等)。留空=admins 名单第一位。"),
   maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),
   maxForwardLayers: NumberInputSchema(5).describe("forward 最大递归层数。默认 5。"),
   maxForwardMessagesPerLayer: NumberInputSchema(8).describe("每层 forward 最多展开多少条子消息。默认 8。"),

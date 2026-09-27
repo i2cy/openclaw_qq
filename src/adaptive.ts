@@ -234,7 +234,7 @@ export function adaptiveConfigure(accountId: string, raw: Record<string, any>, o
         dryRun: Boolean(raw.adaptiveDryRun),
         trace: Boolean(raw.adaptiveTrace),
         maxPerHour: Math.max(1, Number(raw.adaptiveMaxPerHour ?? 20)),
-        notifyUser: adminIds[0] ?? "",
+        notifyUser: String(raw.adaptiveNotifyUser ?? "").trim() || adminIds[0] || "",
         adminOnlyChat: Boolean(raw.adminOnlyChat),
         get selfId() { return String(opts.selfIdGetter() ?? ""); },
     } as AdaptiveAccountConfig;
@@ -567,9 +567,13 @@ async function chatOnce(ep: JudgeEndpoint, messages: ChatMessage[], timeoutMs: n
     const body: Record<string, any> = {
         model: ep.model,
         messages,
-        temperature: 0.2,
-        max_tokens: 700,
-        stream: false,
+        // 不发 temperature:推理型模型(k3 等)会 400 拒绝非 1 的值;判定任务对
+        // 采样温度不敏感,JSON 合规由 prompt+解析重试保障。
+        // max_tokens 预算含推理 tokens(k3 的 reasoning_content 同池),给足。
+        max_tokens: 4000,
+        // 必须流式:本地代理对长耗时非流式请求会在 ~30s 掐掉上游(首包前无字节);
+        // 流式首包快,与网关模型运行时同款姿势。
+        stream: true,
     };
     if (opts?.jsonMode !== false) body.response_format = { type: "json_object" };
     try {
@@ -582,14 +586,95 @@ async function chatOnce(ep: JudgeEndpoint, messages: ChatMessage[], timeoutMs: n
             body: JSON.stringify(body),
             signal: ctrl.signal,
         });
-        const text = await resp.text();
         if (!resp.ok) {
+            const text = await resp.text().catch(() => "");
             // json_mode 不被支持 → 去掉重试一次
             if (resp.status === 400 && opts?.jsonMode !== false && /response_format|json_mode|json object/i.test(text)) {
                 return await chatOnce(ep, messages, timeoutMs, { jsonMode: false });
             }
+            // 部分后端不支持流式 → 降级非流式重试一次
+            if (resp.status === 400 && /stream/i.test(text)) {
+                return await chatOnceNonStream(ep, messages, timeoutMs, opts);
+            }
             throw new Error(`judge HTTP ${resp.status}: ${text.slice(0, 200)}`);
         }
+        // SSE 累积:只要 delta.content(reasoning_content 是思考流,丢弃)
+        let content = "";
+        let reasoningOnly = true;
+        const reader = (resp.body as any)?.[Symbol.asyncIterator]
+            ? null
+            : resp.body?.getReader();
+        const decode = new TextDecoder();
+        let buf = "";
+        const handleLine = (line: string) => {
+            const t = line.trim();
+            if (!t.startsWith("data:")) return;
+            const data = t.slice(5).trim();
+            if (data === "[DONE]") return;
+            try {
+                const chunk = JSON.parse(data);
+                const delta = chunk?.choices?.[0]?.delta;
+                if (typeof delta?.content === "string" && delta.content) {
+                    content += delta.content;
+                    reasoningOnly = false;
+                } else if (delta?.reasoning_content) {
+                    // 思考流:不计入内容
+                }
+                const msgContent = chunk?.choices?.[0]?.message?.content;
+                if (typeof msgContent === "string" && msgContent) { content = msgContent; reasoningOnly = false; }
+            } catch { /* keep-alive/partial line */ }
+        };
+        if (reader) {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decode.decode(value, { stream: true });
+                let idx: number;
+                while ((idx = buf.indexOf("\n")) >= 0) {
+                    const line = buf.slice(0, idx);
+                    buf = buf.slice(idx + 1);
+                    handleLine(line);
+                }
+            }
+            handleLine(buf);
+        } else if ((resp.body as any)?.[Symbol.asyncIterator]) {
+            for await (const part of resp.body as any) {
+                buf += typeof part === "string" ? part : decode.decode(part, { stream: true });
+                let idx: number;
+                while ((idx = buf.indexOf("\n")) >= 0) {
+                    const line = buf.slice(0, idx);
+                    buf = buf.slice(idx + 1);
+                    handleLine(line);
+                }
+            }
+            handleLine(buf);
+        } else {
+            const text = await resp.text();
+            for (const line of text.split("\n")) handleLine(line);
+        }
+        if (!content.trim()) {
+            throw new Error(reasoningOnly ? "judge streamed only reasoning, no content" : "judge returned empty content");
+        }
+        return content;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function chatOnceNonStream(ep: JudgeEndpoint, messages: ChatMessage[], timeoutMs: number, opts?: { jsonMode?: boolean }): Promise<string> {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const body: Record<string, any> = { model: ep.model, messages, max_tokens: 4000, stream: false };
+    if (opts?.jsonMode !== false) body.response_format = { type: "json_object" };
+    try {
+        const resp = await fetch(ep.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...(ep.apiKey ? { authorization: `Bearer ${ep.apiKey}` } : {}) },
+            body: JSON.stringify(body),
+            signal: ctrl.signal,
+        });
+        const text = await resp.text();
+        if (!resp.ok) throw new Error(`judge HTTP ${resp.status}: ${text.slice(0, 200)}`);
         const parsed = JSON.parse(text);
         const content = parsed?.choices?.[0]?.message?.content;
         if (typeof content !== "string" || !content.trim()) throw new Error("judge returned empty content");
@@ -863,10 +948,22 @@ export async function bootstrapCriteriaIfNeeded(accountId: string) {
             "任务: 为 QQ 群聊'主动插嘴'功能生成你的参与判据。列出你想要回复/插嘴的具体情形(以及明确不想插嘴的情形),用第一人称、可执行、10-20 条,尊重人格文件里的公共场合守则(隐私、分寸、不 NSFW)。",
             '只输出 JSON: {"criteria":["情形1","情形2",...],"notCriteria":["不插嘴的情形1",...]}',
         ].join("\n");
-        const out = await chatOnce(ep, [
-            { role: "system", content: sys },
-            { role: "user", content: "请生成判据 JSON。" },
-        ], Math.max(cfg.judgeTimeoutMs, 120000));
+        // 瞬时网络抖动不烧引导预算:会话内小重试
+        let out = "";
+        for (let netTry = 0; ; netTry++) {
+            try {
+                out = await chatOnce(ep, [
+                    { role: "system", content: sys },
+                    { role: "user", content: "请生成判据 JSON。" },
+                ], Math.max(cfg.judgeTimeoutMs, 120000));
+                break;
+            } catch (e: any) {
+                const msg = String(e?.message ?? e);
+                if (netTry >= 2 || !/fetch failed|ECONN|timeout|aborted|socket/i.test(msg)) throw e;
+                alog(`criteria bootstrap transient network error (retry ${netTry + 1}/2): ${msg.slice(0, 120)}`);
+                await new Promise((r) => setTimeout(r, 5000));
+            }
+        }
         const parsed = extractJson(out);
         const want = Array.isArray(parsed?.criteria) ? parsed.criteria.map((s: any) => String(s).trim()).filter(Boolean) : [];
         const not = Array.isArray(parsed?.notCriteria) ? parsed.notCriteria.map((s: any) => String(s).trim()).filter(Boolean) : [];
