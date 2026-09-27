@@ -4248,6 +4248,11 @@ ${current}
                     // the empty-reply fallback in that case.
                     let sawReplyContent = false;
                     let dispatcherError: any = null;
+                    // 2026-09-27: deliver 吞下的 isError final 文本暂存处。harness 判
+                    // incomplete-turn 时,core 会把本轮已产出的 terminal payload 替换成
+                    // 单个 {text,isError:true} final,text 里可能就是真实正文/terminal
+                    // presentation。由 post-dispatch error 分支决定是否补发,不直接丢弃。
+                    const errorSurfacedFinalTexts: string[] = [];
                     let currentRunState: { isStale: () => boolean } | null = null;
                     const forwardThreshold = Number(config.forwardLongReplyThreshold ?? 0);
                     const canUseMergedForward = isGroup && Number.isFinite(forwardThreshold) && forwardThreshold > 0;
@@ -4431,6 +4436,15 @@ ${current}
 
                         if (payload.isError || isTextFailure) {
                             dispatcherError = new Error(payload.text || "API Error");
+                            // WHY: harness incomplete-turn 判定会把已产出的 final 文本
+                            // 打包成 isError payload 送达;这里直接 return 等于把真实
+                            // 回复丢掉,后续 retry 又会被内核去重(skipped:duplicate)
+                            // → 用户全程静默(2026-09-27 11:40:40 / 12:42:32 实锤)。
+                            // 暂存文本交由 error 分支决定补发;已知基础设施故障文本
+                            // (isTextFailure)仍按原样吞掉,保留 retry/fallback 语义。
+                            if (!isTextFailure && info?.kind === "final" && typeof payload.text === "string" && payload.text.trim()) {
+                                errorSurfacedFinalTexts.push(payload.text.trim());
+                            }
                             return;
                         }
                         const phase = resolveReplyPayloadPhase(payload);
@@ -4799,6 +4813,7 @@ ${current}
                                     deliveredAnything = false;
                                     globalDispatchError = null;
                                     dispatcherError = null;
+                                    errorSurfacedFinalTexts.length = 0;
                                     try {
                                         if (tryCount > 0) {
                                             console.log(`[QQ] Model request failed or returned empty. Retrying (${tryCount}/${maxRetries}) after ${retryDelayMs}ms...`);
@@ -4893,6 +4908,32 @@ ${current}
                                                 const flushedFinal = await flushBufferedFinalTexts();
                                                 if (flushedFinal) deliveredAnything = true;
                                                 console.warn(`[QQ] dispatch error after visible content (${errMessage.slice(0, 160)}); flushed buffered reply, skipping retry to avoid duplicates`);
+                                                break out_loop;
+                                            }
+                                            // A harness incomplete-turn outcome must not discard an
+                                            // already-produced final: the isError payload's text (captured
+                                            // in deliver) is this turn's only user-facing content — send it
+                                            // instead of retrying into a kernel dedupe (retry →
+                                            // skipped:duplicate → 静默,2026-09-27 实锤)。仅可重试类错误
+                                            // (session settling / auth·billing fast-fail / rate limit·5xx)
+                                            // 保留原有 retry+failover 路径,行为不变。
+                                            const lowerErrMessage = errMessage.toLowerCase();
+                                            const retryClassifiedError =
+                                                /changed while starting work|reply-operation-active|session file locked|SessionWriteLockTimeout|busy|concurrent modification/i.test(errMessage) ||
+                                                (config.fastFailErrors || ["api key", "no api key found", "not found", "401", "unauthorized", "billing", "余额不足", "已欠费"]).some((word: string) => lowerErrMessage.includes(word.toLowerCase())) ||
+                                                lowerErrMessage.includes("rate limit") || lowerErrMessage.includes("429") || lowerErrMessage.includes("overloaded") ||
+                                                lowerErrMessage.includes("timed out") || lowerErrMessage.includes("timeout") ||
+                                                lowerErrMessage.includes("500") || lowerErrMessage.includes("502") || lowerErrMessage.includes("503") || lowerErrMessage.includes("529");
+                                            if (!retryClassifiedError && errorSurfacedFinalTexts.length > 0) {
+                                                for (const surfacedText of errorSurfacedFinalTexts.splice(0)) {
+                                                    if (runState.isStale()) break;
+                                                    const processed = await prepareOutgoingText(surfacedText);
+                                                    if (currentRunState?.isStale() || !processed.trim()) continue;
+                                                    sawReplyContent = true;
+                                                    const sent = await sendProcessedText(processed);
+                                                    if (sent) deliveredAnything = true;
+                                                }
+                                                console.warn(`[QQ] error outcome (${errMessage.slice(0, 160)}) carried a surfaced final text; delivered it, skipping retry to avoid duplicate-skip silence`);
                                                 break out_loop;
                                             }
                                             resetBufferedUnknownTexts();
