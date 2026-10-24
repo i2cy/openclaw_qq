@@ -2875,7 +2875,25 @@ async function resolveInlineCqRecord(text: string): Promise<string> {
     return result;
 }
 
+function isWorkshopLearnedNotice(message: OneBotMessage | string): boolean {
+    const text = typeof message === "string"
+        ? message
+        : Array.isArray(message)
+            ? message.filter((p: any) => p?.type === "text").map((p: any) => String(p.text ?? "")).join("")
+            : "";
+    return /^\s*💾 Learned:/.test(text);
+}
+
 async function sendOneBotMessageWithAck(client: OneBotClient, to: string, message: OneBotMessage | string, timeoutMs?: number): Promise<{ ok: boolean; data?: any; error?: string }> {
+    if (isWorkshopLearnedNotice(message)) {
+        // Self-learning change notices are announced to the last-used channel
+        // by design (openclaw 10.x, no upstream mute knob); dad opted for
+        // plugin-side muting (2026-10-24). ok:true so the kernel counts it as
+        // delivered — the undo system-event stays in the transcript, so
+        // saying "undo" still reverts the skill change.
+        console.log(`[QQ] workshop learned-notice muted to=${to}`);
+        return { ok: true, data: { muted: "workshop-notice" } };
+    }
     try {
         if (to.startsWith("group:")) {
             const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message, timeoutMs);
@@ -5277,14 +5295,31 @@ ${current}
                                     console.log(`[QQ] requeueing payload sess=${route.sessionKey} attempt=${attempt}/${REQUEUE_MAX} backoff=${requeueBackoffMs}ms`);
                                     setTimeout(() => {
                                         const s = sessionQueues.get(route.sessionKey);
-                                        if (!s) return;
+                                        if (!s) {
+                                            // FIX 2026-10-24 04:04: the previous dispatch finished
+                                            // during the backoff window and drainSessionQueue deleted the
+                                            // queue state — old code returned here and the payload died
+                                            // SILENTLY (dad saw the 排队 notice and never got a reply).
+                                            // Rebuild the queue state and let the payload enqueue normally.
+                                            console.log(`[QQ] requeue: session queue state was gone; rebuilding sess=${route.sessionKey}`);
+                                            sessionQueues.set(route.sessionKey, { pendingPayloads: [], timer: null, isProcessing: false, latestEpoch: 0, activeEpoch: 0 });
+                                        }
                                         // Retry drain until the session accepts the payload. A drain
                                         // already in flight (new message arrived meanwhile) merges it.
                                         let drainTries = 0;
                                         const tryDrain = () => {
                                             drainTries += 1;
                                             const st = sessionQueues.get(route.sessionKey);
-                                            if (!st || drainTries > 12) return;
+                                            if (!st || drainTries > 12) {
+                                                console.warn(`[QQ] requeue drain gave up sess=${route.sessionKey} reason=${!st ? "state-vanished" : "busy>120s"}`);
+                                                const busyLostText = "⚠️ 上一轮持续忙碌超时（约 2 分钟），这条消息没能自动补上——请再发一次。";
+                                                try {
+                                                    if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${busyLostText}`);
+                                                    else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, busyLostText);
+                                                    else client.sendPrivateMsg(userId, busyLostText);
+                                                } catch { /* best-effort notice */ }
+                                                return;
+                                            }
                                             if (!st.isProcessing) {
                                                 st.pendingPayloads.push({
                                                     ctxPayload: mergedCtx,
