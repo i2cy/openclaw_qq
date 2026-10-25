@@ -2975,43 +2975,45 @@ function getRuntimeCfgForAccount(accountId: string | undefined | null): Partial<
 }
 
 function splitIntoHumanBubbles(text: string, maxChars: number): string[] {
+    // Paragraphs ARE the bubbles (dad, 2026-10-25): only paragraphs that exceed
+    // maxChars get demoted to sentence/clause splitting. Never merge across
+    // paragraph boundaries — that reads mechanical.
     const clean = text.trimEnd();
     if (!clean) return [];
-    if (clean.length <= maxChars) return [clean];
+    const paras = clean.split(/\n\s*\n+/).map(p => p.trim()).filter(Boolean);
+    if (paras.length <= 1 && clean.length <= maxChars) return [clean];
     const bubbles: string[] = [];
-    let buf = "";
-    const push = (s: string) => {
-        const piece = s.trim();
-        if (!piece) return;
-        if (!buf) buf = piece;
-        else if (buf.length + 1 + piece.length <= maxChars) buf += "\n" + piece;
-        else { bubbles.push(buf); buf = piece; }
-    };
-    const hardSplit = (s: string) => {
-        let rest = s;
-        while (rest.length > maxChars) { bubbles.push(buf ? `${buf}\n${rest.slice(0, maxChars)}` : rest.slice(0, maxChars)); buf = ""; rest = rest.slice(maxChars); }
-        push(rest);
-    };
-    for (const para of clean.split(/\n\s*\n+/)) {
-        if (para.length > maxChars) {
-            for (let sent of para.split(/(?<=[。！？!?…；;])/)) {
-                sent = sent.trim();
-                if (!sent) continue;
-                if (sent.length > maxChars) {
-                    let acc = "";
-                    for (const clause of sent.split(/(?<=[，,、])/)) {
-                        if (clause.length > maxChars) { if (acc) { bubbles.push(acc); acc = ""; } hardSplit(clause); continue; }
-                        if (!acc) acc = clause;
-                        else if (acc.length + clause.length <= maxChars) acc += clause;
-                        else { bubbles.push(acc); acc = clause; }
+    for (const para of paras) {
+        if (para.length <= maxChars) { bubbles.push(para); continue; }
+        let buf = "";
+        const push = (s: string) => {
+            const piece = s.trim();
+            if (!piece) return;
+            if (!buf) buf = piece;
+            else if (buf.length + 1 + piece.length <= maxChars) buf += "\n" + piece;
+            else { bubbles.push(buf); buf = piece; }
+        };
+        for (let sent of para.split(/(?<=[。！？!?…；;])/)) {
+            sent = sent.trim();
+            if (!sent) continue;
+            if (sent.length > maxChars) {
+                let acc = "";
+                for (const clause of sent.split(/(?<=[，,、])/)) {
+                    if (clause.length > maxChars) {
+                        let rest = clause;
+                        while (rest.length > maxChars) { if (acc) { bubbles.push(acc); acc = ""; } bubbles.push(rest.slice(0, maxChars)); rest = rest.slice(maxChars); }
+                        push(rest);
+                        continue;
                     }
-                    if (acc) push(acc);
-                } else push(sent);
-            }
-            if (buf) { bubbles.push(buf); buf = ""; }
-        } else push(para);
+                    if (!acc) acc = clause;
+                    else if (acc.length + clause.length <= maxChars) acc += clause;
+                    else { bubbles.push(acc); acc = clause; }
+                }
+                if (acc) push(acc);
+            } else push(sent);
+        }
+        if (buf) bubbles.push(buf);
     }
-    if (buf) bubbles.push(buf);
     return bubbles.filter(b => b.trim());
 }
 
@@ -3039,7 +3041,7 @@ async function sendQQTextMessage(params: {
 }): Promise<any> {
     const normalizedText = await resolveInlineCqRecord(params.text || "");
     if (!normalizedText.trim()) return null;
-    const hum = params.humanize && !/\[CQ:/.test(normalizedText) && normalizedText.length > params.humanize.maxChars
+    const hum = params.humanize && !/\[CQ:/.test(normalizedText) && (normalizedText.length > params.humanize.maxChars || /\n\s*\n/.test(normalizedText))
         ? splitIntoHumanBubbles(normalizedText, params.humanize.maxChars)
         : null;
     const chunks = hum && hum.length > 1 ? hum : splitMessage(normalizedText, 4000);
@@ -4567,7 +4569,7 @@ ${current}
                      const sendProcessedText = async (processed: string): Promise<boolean> => {
                         if (currentRunState?.isStale()) return false;
                         const humOpts = resolveHumanizeOpts(config);
-                        const canHumanize = Boolean(humOpts) && !/\[CQ:/.test(processed) && processed.trim().length > humOpts!.maxChars;
+                        const canHumanize = Boolean(humOpts) && !/\[CQ:/.test(processed) && (processed.trim().length > humOpts!.maxChars || /\n\s*\n/.test(processed));
                         const chunks = canHumanize ? splitIntoHumanBubbles(processed, humOpts!.maxChars) : splitMessage(processed, config.maxMessageLength || 4000);
                         if (canHumanize && chunks.length > 1) console.log(`[QQ] humanized reply bubbles=${chunks.length} maxChars=${humOpts!.maxChars} group=${groupId || userId}`);
                         for (let i = 0; i < chunks.length; i++) {
