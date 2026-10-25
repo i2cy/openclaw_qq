@@ -2974,16 +2974,77 @@ function getRuntimeCfgForAccount(accountId: string | undefined | null): Partial<
         || {}) as Partial<QQConfig>;
 }
 
+function splitIntoHumanBubbles(text: string, maxChars: number): string[] {
+    const clean = text.trimEnd();
+    if (!clean) return [];
+    if (clean.length <= maxChars) return [clean];
+    const bubbles: string[] = [];
+    let buf = "";
+    const push = (s: string) => {
+        const piece = s.trim();
+        if (!piece) return;
+        if (!buf) buf = piece;
+        else if (buf.length + 1 + piece.length <= maxChars) buf += "\n" + piece;
+        else { bubbles.push(buf); buf = piece; }
+    };
+    const hardSplit = (s: string) => {
+        let rest = s;
+        while (rest.length > maxChars) { bubbles.push(buf ? `${buf}\n${rest.slice(0, maxChars)}` : rest.slice(0, maxChars)); buf = ""; rest = rest.slice(maxChars); }
+        push(rest);
+    };
+    for (const para of clean.split(/\n\s*\n+/)) {
+        if (para.length > maxChars) {
+            for (let sent of para.split(/(?<=[。！？!?…；;])/)) {
+                sent = sent.trim();
+                if (!sent) continue;
+                if (sent.length > maxChars) {
+                    let acc = "";
+                    for (const clause of sent.split(/(?<=[，,、])/)) {
+                        if (clause.length > maxChars) { if (acc) { bubbles.push(acc); acc = ""; } hardSplit(clause); continue; }
+                        if (!acc) acc = clause;
+                        else if (acc.length + clause.length <= maxChars) acc += clause;
+                        else { bubbles.push(acc); acc = clause; }
+                    }
+                    if (acc) push(acc);
+                } else push(sent);
+            }
+            if (buf) { bubbles.push(buf); buf = ""; }
+        } else push(para);
+    }
+    if (buf) bubbles.push(buf);
+    return bubbles.filter(b => b.trim());
+}
+
+function humanBubbleDelayMs(len: number, perCharMs: number, minMs: number, maxMs: number): number {
+    return Math.max(minMs, Math.min(maxMs, Math.round(len * perCharMs)));
+}
+
+function resolveHumanizeOpts(cfg: any): { maxChars: number; perCharMs: number; minMs: number; maxMs: number } | undefined {
+    if (!cfg || cfg.humanizeBubbles === false) return undefined;
+    return {
+        maxChars: Math.max(20, Number(cfg.humanBubbleMaxChars) || 80),
+        perCharMs: Math.max(0, Number(cfg.typingDelayMsPerChar ?? 120)),
+        minMs: Math.max(0, Number(cfg.bubbleDelayMinMs ?? 800)),
+        maxMs: Math.max(100, Number(cfg.bubbleDelayMaxMs ?? 4500)),
+    };
+}
+
 async function sendQQTextMessage(params: {
     client: OneBotClient;
     to: string;
     text: string;
     replyToId?: string | null;
     delayBetweenChunksMs?: number;
+    humanize?: { maxChars: number; perCharMs: number; minMs: number; maxMs: number };
 }): Promise<any> {
     const normalizedText = await resolveInlineCqRecord(params.text || "");
     if (!normalizedText.trim()) return null;
-    const chunks = splitMessage(normalizedText, 4000);
+    const hum = params.humanize && !/\[CQ:/.test(normalizedText) && normalizedText.length > params.humanize.maxChars
+        ? splitIntoHumanBubbles(normalizedText, params.humanize.maxChars)
+        : null;
+    const chunks = hum && hum.length > 1 ? hum : splitMessage(normalizedText, 4000);
+    const useHumanDelay = Boolean(hum && hum.length > 1);
+    if (useHumanDelay) console.log(`[QQ] humanized sendText to=${params.to} bubbles=${hum!.length} maxChars=${params.humanize!.maxChars}`);
     let lastAck: any = null;
     for (let i = 0; i < chunks.length; i += 1) {
         let message: OneBotMessage | string = chunks[i];
@@ -2993,7 +3054,11 @@ async function sendQQTextMessage(params: {
         const ack = await sendOneBotMessageWithAck(params.client, params.to, message);
         if (!ack.ok) throw new Error(ack.error || "Failed to send text");
         lastAck = ack.data;
-        if (chunks.length > 1) await sleep(params.delayBetweenChunksMs ?? 1000);
+        if (i < chunks.length - 1) {
+            await sleep(useHumanDelay
+                ? humanBubbleDelayMs(chunks[i].length, params.humanize!.perCharMs, params.humanize!.minMs, params.humanize!.maxMs)
+                : (params.delayBetweenChunksMs ?? 1000));
+        }
     }
     return lastAck;
 }
@@ -4499,9 +4564,12 @@ ${current}
                         return await resolveInlineCqRecord(processed);
                     };
 
-                    const sendProcessedText = async (processed: string): Promise<boolean> => {
+                     const sendProcessedText = async (processed: string): Promise<boolean> => {
                         if (currentRunState?.isStale()) return false;
-                        const chunks = splitMessage(processed, config.maxMessageLength || 4000);
+                        const humOpts = resolveHumanizeOpts(config);
+                        const canHumanize = Boolean(humOpts) && !/\[CQ:/.test(processed) && processed.trim().length > humOpts!.maxChars;
+                        const chunks = canHumanize ? splitIntoHumanBubbles(processed, humOpts!.maxChars) : splitMessage(processed, config.maxMessageLength || 4000);
+                        if (canHumanize && chunks.length > 1) console.log(`[QQ] humanized reply bubbles=${chunks.length} maxChars=${humOpts!.maxChars} group=${groupId || userId}`);
                         for (let i = 0; i < chunks.length; i++) {
                             if (currentRunState?.isStale()) return i > 0;
                             let chunk = chunks[i];
@@ -4526,7 +4594,10 @@ ${current}
                                 }
                             }
 
-                            if (chunks.length > 1 && config.rateLimitMs > 0) await sleep(config.rateLimitMs);
+                            if (i < chunks.length - 1) {
+                                if (canHumanize) await sleep(humanBubbleDelayMs(chunks[i].length, humOpts!.perCharMs, humOpts!.minMs, humOpts!.maxMs));
+                                else if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
+                            }
                         }
                         // 自适应窗口:Cody 自己的群发言镜像入窗(judge 需要看到她说过什么)
                         if (isGroup && chunks.length > 0) adaptive.recordSelfMessage(account.accountId, String(groupId), processed);
@@ -4539,7 +4610,12 @@ ${current}
                         meta: { phaseLabel: string; reason?: string },
                     ): Promise<boolean> => {
                         if (currentRunState?.isStale() || texts.length === 0) return false;
-                        if (canUseMergedForward && totalLen >= forwardThreshold) {
+                        if (meta.phaseLabel !== "final_answer" && config.deliverMidTurn !== true) {
+                            console.log(`[QQ] mid-turn batch muted (${meta.phaseLabel}) texts=${texts.length} len=${totalLen}`);
+                            return true;
+                        }
+                        const humCfgActive = resolveHumanizeOpts(config);
+                        if (canUseMergedForward && !humCfgActive && totalLen >= forwardThreshold) {
                             const sentAsForward = await sendLongTextAsForwardMessage({
                                 client,
                                 groupId,
@@ -4653,6 +4729,13 @@ ${current}
                                     const flushedBufferedFinal = await flushBufferedFinalTexts();
                                     if (flushedBufferedFinal) deliveredAnything = true;
                                     await bufferUnknownBlockText(processed);
+                                } else if (phase !== "final_answer" && config.deliverMidTurn !== true) {
+                                    // mid-turn commentary stays in the transcript, out of QQ (dad rule
+                                    // 2026-10-25): only final_answer reaches the chat; the kernel merges
+                                    // buffered mid-turn text into final anyway. Intentional silence
+                                    // counts as delivered so retry/fallback logic stays quiet.
+                                    deliveredAnything = true;
+                                    console.log(`[QQ] mid-turn text muted (phase=${phase || "block"}) len=${processed.length}`);
                                 } else {
                                     const flushedBufferedUnknown = await flushBufferedUnknownTexts(`before_${phase || info?.kind || "text"}`);
                                     if (flushedBufferedUnknown) deliveredAnything = true;
@@ -5428,7 +5511,7 @@ ${current}
         sendText: async ({ to, text, accountId, replyToId }) => {
             const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
             if (!client) throw new Error("QQ client not connected");
-            const lastAck = await sendQQTextMessage({ client, to, text, replyToId });
+            const lastAck = await sendQQTextMessage({ client, to, text, replyToId, humanize: resolveHumanizeOpts(accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID)) });
             return {
                 channel: "qq",
                 messageId: resolveOutboundMessageId(lastAck),
