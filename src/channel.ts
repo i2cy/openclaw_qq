@@ -4442,12 +4442,14 @@ ${current}
                         const now = Date.now();
                         const cooldownMs = Math.max(0, Number(liveCfg.groupAtCooldownMs ?? 600000));
                         if (cooldownMs > 0 && now - (lastGroupAtAt.get(groupAtKey) ?? 0) < cooldownMs) return null;
-                        if (adaptiveSynthetic && liveCfg.groupAtAdaptive !== false) return "adaptive";
+                        if (adaptiveSynthetic) return null; // auto-interjects never @ anyone (dad, 2026-10-25): the @ target is the judge's trigger sender, not who Cody is talking to — always looked like "wrong person"
                         const slowMs = Math.max(0, Number(liveCfg.groupAtSlowMs ?? 600000));
                         const elapsedMs = now - inboundReceivedAt;
                         if (slowMs > 0 && elapsedMs >= slowMs) return `slow(${Math.round(elapsedMs / 1000)}s)`;
                         return null;
                     };
+
+                    const groupAt = () => (isGroup && !adaptiveSynthetic ? `[CQ:at,qq=${userId}] ` : "");
 
                     const takeReplySessionSourcePrefix = (): string => {
                         if (!pendingReplySessionSourcePrefix) return "";
@@ -4459,7 +4461,7 @@ ${current}
                     const sendSessionSourcePrefixOnly = async (): Promise<boolean> => {
                         const prefix = takeReplySessionSourcePrefix();
                         if (!prefix || currentRunState?.isStale()) return false;
-                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${prefix}`);
+                        if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${prefix}`);
                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, prefix);
                         else client.sendPrivateMsg(userId, prefix);
                         return true;
@@ -5221,7 +5223,7 @@ ${current}
                                                 } else {
                                                     const fallbackText = (config.emptyReplyFallbackText || "⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。").trim();
                                                     if (fallbackText) {
-                                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${fallbackText}`);
+                                                        if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${fallbackText}`);
                                                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, fallbackText);
                                                         else client.sendPrivateMsg(userId, fallbackText);
                                                     }
@@ -5287,7 +5289,7 @@ ${current}
                                     if (requeueCount === 1) {
                                         const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试（最长约 8 分钟），不用重发。";
                                         console.log(`[QQ] dispatch hit transient session settle; scheduling long-tail requeue (attempt 1/${REQUEUE_MAX})`);
-                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${noticeText}`);
+                                        if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${noticeText}`);
                                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, noticeText);
                                         else client.sendPrivateMsg(userId, noticeText);
                                     }
@@ -5314,7 +5316,7 @@ ${current}
                                                 console.warn(`[QQ] requeue drain gave up sess=${route.sessionKey} reason=${!st ? "state-vanished" : "busy>120s"}`);
                                                 const busyLostText = "⚠️ 上一轮持续忙碌超时（约 2 分钟），这条消息没能自动补上——请再发一次。";
                                                 try {
-                                                    if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${busyLostText}`);
+                                                    if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${busyLostText}`);
                                                     else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, busyLostText);
                                                     else client.sendPrivateMsg(userId, busyLostText);
                                                 } catch { /* best-effort notice */ }
@@ -5338,7 +5340,7 @@ ${current}
                                 } else {
                                     const lostText = "⚠️ 上一轮收尾超时（约 8 分钟），这条消息没能自动补上——请再发一次。";
                                     console.warn(`[QQ] requeue budget exhausted for sess=${route.sessionKey}; notifying user.`);
-                                    if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${lostText}`);
+                                    if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${lostText}`);
                                     else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostText);
                                     else client.sendPrivateMsg(userId, lostText);
                                 }
