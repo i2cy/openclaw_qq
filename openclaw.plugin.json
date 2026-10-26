@@ -15,7 +15,6 @@
       "schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "additionalProperties": true,
         "properties": {
           "wsUrl": {
             "description": "OneBot WebSocket 地址。示例：ws://127.0.0.1:3001",
@@ -42,6 +41,11 @@
           },
           "enableDeduplication": {
             "description": "启用消息去重，避免重复回复。",
+            "default": true,
+            "type": "boolean"
+          },
+          "enableSessionLockRecovery": {
+            "description": "启用会话写锁强制恢复。开启后，当 abort 超时导致 openclaw 会话写锁残留（SessionWriteLockTimeoutError）时，插件会自动删除属于本 gateway 进程的过期锁文件，避免会话被锁死最长 62 分钟。",
             "default": true,
             "type": "boolean"
           },
@@ -134,7 +138,7 @@
             "type": "boolean"
           },
           "maxMessageLength": {
-            "description": "单条消息最大长度，超出后自动分段发送。",
+            "description": "单条消息最大长度；humanizeBubbles 开启时它同时是气泡粒度上限：段落超过此长度才按句号/逗号断句（不硬切）。",
             "default": 4000,
             "type": "number"
           },
@@ -198,6 +202,16 @@
             "default": "/openclaw_media",
             "type": "string"
           },
+          "outboundMediaBridgeUrl": {
+            "description": "可选：大文件落盘桥接 URL（跨机部署时 NapCat 的 JSON 负载有 ~9MB 硬墙，>8MB 的文件由桥接服务落盘后按容器内路径引用发送）。示例：http://10.0.2.206:6199。",
+            "default": "",
+            "type": "string"
+          },
+          "outboundMediaBridgeToken": {
+            "description": "可选：落盘桥接的 Bearer token（与桥接服务启动环境 QQVC_TOKEN 一致，默认 qq-voice-bridge）。",
+            "default": "",
+            "type": "string"
+          },
           "enableGuilds": {
             "description": "是否启用 QQ 频道（Guild）支持。",
             "default": true,
@@ -226,6 +240,130 @@
               "text_end",
               "message_end"
             ]
+          },
+          "commentaryPayloads": {
+            "description": "是否把中间轮次的评论性文本实时投递到 QQ（模型在工具调用之间产生的可见文本，如“稍等，正在画…”）。默认开启。实现：插件通过 replyOptions.onItemEvent 接收核心的 preamble 进度事件并自行发送（completions 模型的中间文本被 harness 打上 commentary 签名后不会进入常规 block 管线，这是唯一受支持出口）；同时插件独占 commentary 所有权，避免 verbose 模式的 💬 通道把最终回复重复发送。中间文本会被折叠为单行，[[tts:text]] 标签解包为文字，MEDIA: 指令被忽略。关闭则只发回合最终回复。",
+            "default": true,
+            "type": "boolean"
+          },
+          "adaptiveGroups": {
+            "description": "自适应触发白名单群号(逗号分隔)。空=功能关闭。白名单群中无需 @/关键词，由判定模型根据人格+判据+滚动窗口决定是否主动插嘴；仍需同时通过 allowedGroups。",
+            "default": "",
+            "type": "string"
+          },
+          "adaptiveAdminsOnly": {
+            "description": "仅 admins 名单成员的新消息触发判定(窗口记录不受此限制,受 adaptiveRecordScope 控制)。默认关闭:任何成员消息都可触发,判定权在模型。",
+            "default": false,
+            "type": "boolean"
+          },
+          "adaptiveRecordScope": {
+            "description": "窗口记录范围:all=所有成员消息;admins=仅 admins 名单成员。默认 all。",
+            "default": "all",
+            "type": "string",
+            "enum": [
+              "all",
+              "admins"
+            ]
+          },
+          "adaptiveWindowMaxMessages": {
+            "description": "每群滚动窗口最大消息条数。默认 60;超出从最旧淘汰,但 adaptiveWindowMinDays 内的消息受保护。",
+            "default": 60,
+            "type": "number"
+          },
+          "adaptiveWindowMinDays": {
+            "description": "窗口消息最少保留天数(安静群不至于只剩几条)。默认 2。另有 14 天硬过期与 adaptiveWindowHardCap 硬顶。",
+            "default": 2,
+            "type": "number"
+          },
+          "adaptiveWindowHardCap": {
+            "description": "窗口绝对硬顶条数(爆聊群防失控)。默认 300。",
+            "default": 300,
+            "type": "number"
+          },
+          "adaptiveCooldownMs": {
+            "description": "同一群两次判定之间的最小间隔(毫秒)。默认 120000(2分钟)。",
+            "default": 120000,
+            "type": "number"
+          },
+          "adaptiveReplyCooldownMs": {
+            "description": "实际发出插嘴回复后的更长冷却(毫秒),防止连环插嘴。默认 600000(10分钟)。",
+            "default": 600000,
+            "type": "number"
+          },
+          "adaptiveDebounceMs": {
+            "description": "触发判定的聚合窗口(毫秒):短时间连发多条消息合并为一次判定,以最后一条为触发消息。默认 8000。",
+            "default": 8000,
+            "type": "number"
+          },
+          "adaptiveJudgeTimeoutMs": {
+            "description": "判定模型单次调用超时(毫秒)。默认 60000。",
+            "default": 60000,
+            "type": "number"
+          },
+          "adaptiveJudgeMaxRetries": {
+            "description": "判定输出解析失败时的带错重试次数。默认 3;全部失败则本轮放弃(冷却照常)。",
+            "default": 3,
+            "type": "number"
+          },
+          "adaptiveJudgeModel": {
+            "description": "判定模型,格式 provider/model,凭据取自 models.providers。留空(默认)=跟随 openclaw.json 的 agents.defaults.model:primary 优先、fallbacks 依序候补(网络类失败自动切换,每次判定时现读配置,主模型热切换即时生效)。人格头 ~20k tokens,建议本地/廉价模型。",
+            "default": "",
+            "type": "string"
+          },
+          "adaptiveReplyCriteria": {
+            "description": "插嘴判据文本。留空时首次启用会自动引导:用判定模型+人格文件生成'你想插嘴的情形'并写入本字段(热更新),同时私聊通知第一位 admin。",
+            "default": "",
+            "type": "string"
+          },
+          "adaptiveQuietHours": {
+            "description": "自适应触发静默时段(本地时间 HH:MM-HH:MM,支持跨午夜)。时段内不主动插嘴;@提及/关键词照常即时回复。默认 23:30-08:00,留空关闭。",
+            "default": "23:30-08:00",
+            "type": "string"
+          },
+          "adaptiveDryRun": {
+            "description": "只判定+写审计日志(/tmp/qq_adaptive.log),不真正注入回复。调教判据期神器。默认关闭。",
+            "default": false,
+            "type": "boolean"
+          },
+          "adaptiveTrace": {
+            "description": "输出详细判定过程日志(冷却跳过/排队/窗口变化等)。默认关闭。",
+            "default": false,
+            "type": "boolean"
+          },
+          "adaptiveMaxPerHour": {
+            "description": "每群每小时判定次数上限(成本护栏)。默认 20。",
+            "default": 20,
+            "type": "number"
+          },
+          "adaptiveReframeAfterMs": {
+            "description": "完整制度框架的最长间隔(毫秒,默认 24h=至少一天一次制度提醒)。其余注入只带一行心情+消息列表;会话被压缩(compactionCount 实测)或 /newsession 时立即重发框架,保证同一会话上下文里始终至少保留一次提醒。",
+            "default": 86400000,
+            "type": "number"
+          },
+          "adaptiveReframeEveryN": {
+            "description": "每 N 次精简注入后强制重发一次完整框架(压缩探测失败时的兜底,默认 8;0=关闭)。",
+            "default": 8,
+            "type": "number"
+          },
+          "groupAtCooldownMs": {
+            "description": "同一群两次 @ 之间的最小间隔(毫秒)。任何一次 @ 之后的这段时间内,该群回复不再 @ 任何人。默认 600000(10分钟);0=不抑制。",
+            "default": 600000,
+            "type": "number"
+          },
+          "groupAtSlowMs": {
+            "description": "单次 inbound 从收到到发出某条回复超过该时长(毫秒)时,视为长任务汇报,@ 发起人。默认 600000(10分钟);0=禁用此规则。普通即时回复一律不 @。",
+            "default": 600000,
+            "type": "number"
+          },
+          "groupAtAdaptive": {
+            "description": "主动插嘴(自适应触发)的回复是否 @ 触发人。默认开启(仍受 groupAtCooldownMs 抑制)。",
+            "default": true,
+            "type": "boolean"
+          },
+          "adaptiveNotifyUser": {
+            "description": "自适应功能的私聊通知对象(判据引导完成等)。留空=admins 名单第一位。",
+            "default": "",
+            "type": "string"
           },
           "maxReplyLayers": {
             "description": "reply 最大递归层数。默认 5。",
@@ -297,6 +435,36 @@
             "default": 300,
             "type": "number"
           },
+          "deliverMidTurn": {
+            "description": "是否把 commentary/unknown 等 mid-turn 文本转发到 QQ。默认 false：只发 final_answer（内核会把中途攒下的文本并进 final）。",
+            "default": false,
+            "type": "boolean"
+          },
+          "humanizeBubbles": {
+            "description": "按段落拆成多条气泡分别发送，模拟人类连发（含主动 sendText）。单段超过 maxMessageLength 时按句号/逗号断句。开启时 final 长回复不再转合并转发卡。",
+            "default": true,
+            "type": "boolean"
+          },
+          "typingDelayMsPerChar": {
+            "description": "humanizeBubbles 气泡间延迟 = 上一条气泡长度 × 本比例（毫秒/字符），即打字速度系数。",
+            "default": 120,
+            "type": "number"
+          },
+          "stripTrailingPeriod": {
+            "description": "去掉每条气泡结尾的单个句号（。或.），更口语化；结尾连续点号（... / 。。。）视为省略号原样保留。",
+            "default": true,
+            "type": "boolean"
+          },
+          "bubbleDelayMinMs": {
+            "description": "气泡间最短延迟（毫秒）。默认 800。",
+            "default": 800,
+            "type": "number"
+          },
+          "bubbleDelayMaxMs": {
+            "description": "气泡间最长延迟（毫秒）。默认 4500。",
+            "default": 4500,
+            "type": "number"
+          },
           "forwardNodeCharLimit": {
             "description": "启用长回复合并转发时，每个转发节点的最大字符数。默认 0，表示不按长度拆节点；同一轮回复的多条 assistant message 会尽量合并进一个转发。",
             "default": 0,
@@ -307,7 +475,97 @@
             "default": "OpenClaw",
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "wsUrl",
+          "admins",
+          "requireMention",
+          "enableDeduplication",
+          "enableSessionLockRecovery",
+          "enableErrorNotify",
+          "adminOnlyChat",
+          "notifyNonAdminBlocked",
+          "nonAdminBlockedMessage",
+          "blockedNotifyCooldownMs",
+          "enableEmptyReplyFallback",
+          "emptyReplyFallbackText",
+          "maxRetries",
+          "retryDelayMs",
+          "fastFailErrors",
+          "showProcessingStatus",
+          "showReplySessionSource",
+          "processingStatusDelayMs",
+          "processingStatusIntervalMs",
+          "processingStatusText",
+          "processingPulseText",
+          "autoApproveRequests",
+          "maxMessageLength",
+          "formatMarkdown",
+          "antiRiskMode",
+          "allowedGroups",
+          "blockedUsers",
+          "historyLimit",
+          "keywordOnlyTrigger",
+          "keywordTriggers",
+          "allowBareGroupCommands",
+          "enableDynamicModelCatalog",
+          "enableTTS",
+          "sharedMediaHostDir",
+          "sharedMediaContainerDir",
+          "outboundMediaBridgeUrl",
+          "outboundMediaBridgeToken",
+          "enableGuilds",
+          "enrichReplyForwardContext",
+          "cacheInboundImagesToLocal",
+          "blockStreaming",
+          "blockStreamingBreak",
+          "commentaryPayloads",
+          "adaptiveGroups",
+          "adaptiveAdminsOnly",
+          "adaptiveRecordScope",
+          "adaptiveWindowMaxMessages",
+          "adaptiveWindowMinDays",
+          "adaptiveWindowHardCap",
+          "adaptiveCooldownMs",
+          "adaptiveReplyCooldownMs",
+          "adaptiveDebounceMs",
+          "adaptiveJudgeTimeoutMs",
+          "adaptiveJudgeMaxRetries",
+          "adaptiveJudgeModel",
+          "adaptiveReplyCriteria",
+          "adaptiveQuietHours",
+          "adaptiveDryRun",
+          "adaptiveTrace",
+          "adaptiveMaxPerHour",
+          "adaptiveReframeAfterMs",
+          "adaptiveReframeEveryN",
+          "groupAtCooldownMs",
+          "groupAtSlowMs",
+          "groupAtAdaptive",
+          "adaptiveNotifyUser",
+          "maxReplyLayers",
+          "maxForwardLayers",
+          "maxForwardMessagesPerLayer",
+          "maxCharsPerLayer",
+          "maxTotalContextChars",
+          "includeSenderInLayers",
+          "includeCurrentOutline",
+          "rateLimitMs",
+          "enableQueueNotify",
+          "queueDebounceMs",
+          "injectGatewayMeta",
+          "interruptOnNewMessage",
+          "forwardLongReplyThreshold",
+          "deliverMidTurn",
+          "humanizeBubbles",
+          "typingDelayMsPerChar",
+          "stripTrailingPeriod",
+          "bubbleDelayMinMs",
+          "bubbleDelayMaxMs",
+          "forwardNodeCharLimit",
+          "forwardNodeName"
+        ],
+        "additionalProperties": {}
       },
       "uiHints": {
         "maxRetries": {
@@ -361,6 +619,302 @@
         "allowBareGroupCommands": {
           "label": "允许群聊裸 slash 指令",
           "help": "默认关闭。关闭后，/model 这类群聊指令需要配合关键词触发；如果想恢复旧体验再手动开启。"
+        },
+        "commentaryPayloads": {
+          "label": "中间轮次评论实时送达",
+          "help": "默认开启。模型在工具调用之间说的可见文本(如“稍等,正在画…”)实时发到 QQ;关闭则只保留回合最终回复。"
+        },
+        "adaptiveGroups": {
+          "label": "自适应触发白名单群",
+          "help": "群号列表(逗号分隔),空=功能关闭。白名单群里无需 @/关键词,由判定模型按人格+判据决定是否主动插嘴;@提及路径不受影响。"
+        },
+        "adaptiveAdminsOnly": {
+          "label": "仅管理员消息触发判定",
+          "help": "默认关闭(任何成员消息都可触发判定)。开启后只有 admins 名单成员的新消息会发起判定。"
+        },
+        "adaptiveRecordScope": {
+          "label": "窗口记录范围",
+          "help": "all=记录所有成员消息(默认);admins=仅记录 admins 名单成员。"
+        },
+        "adaptiveWindowMaxMessages": {
+          "label": "窗口最大条数",
+          "help": "每群滚动窗口消息上限,默认 60;超出从最旧淘汰(adaptiveWindowMinDays 内受保护)。"
+        },
+        "adaptiveWindowMinDays": {
+          "label": "窗口最少保留天数",
+          "help": "默认 2 天:安静群的消息不会因为条数上限被过早淘汰。"
+        },
+        "adaptiveCooldownMs": {
+          "label": "判定冷却(毫秒)",
+          "help": "同一群两次判定最小间隔,默认 120000(2分钟)。"
+        },
+        "adaptiveReplyCooldownMs": {
+          "label": "插嘴后冷却(毫秒)",
+          "help": "实际发出插嘴回复后的更长冷却,默认 600000(10分钟),防连环插嘴。"
+        },
+        "adaptiveJudgeModel": {
+          "label": "判定模型",
+          "help": "provider/model 格式,凭据取自 models.providers。默认(留空)=dgx-spark/qwen3.8-flash-next(本地免费)。每次判定含 ~20k tokens 人格头,建议本地/廉价模型。"
+        },
+        "adaptiveReplyCriteria": {
+          "label": "插嘴判据",
+          "help": "留空时首次启用自动引导生成(模型带人格列出想插嘴的情形)并写入本字段;可随时手改。群内 /adaptive criteria|relearn 亦可管理。"
+        },
+        "adaptiveQuietHours": {
+          "label": "静默时段",
+          "help": "HH:MM-HH:MM(本地时间,支持跨午夜),时段内不主动插嘴;@提及照常。默认 23:30-08:00,留空关闭。"
+        },
+        "adaptiveDryRun": {
+          "label": "只判定不插嘴(dry run)",
+          "help": "判定照常跑并写审计日志 /tmp/qq_adaptive.log,但不注入回复。调教判据期用。"
+        },
+        "groupAtCooldownMs": {
+          "label": "群 @ 冷却(毫秒)",
+          "help": "任何一次 @ 之后,这段时间内该群回复不再 @ 任何人。默认 600000(10分钟)。"
+        },
+        "groupAtSlowMs": {
+          "label": "长任务汇报 @ 阈值(毫秒)",
+          "help": "响应耗时超过该值才 @ 发起人汇报结果。默认 600000(10分钟);普通即时回复一律不 @。"
+        },
+        "groupAtAdaptive": {
+          "label": "主动插嘴时 @ 触发人",
+          "help": "默认开启;仍受群 @ 冷却约束(刚 @ 过就不再 @)。"
+        },
+        "accessToken": {
+          "label": "OneBot 访问令牌",
+          "help": "需与 NapCat/OneBot 端配置一致；留空表示不鉴权。敏感信息，修改后需保存并重载。"
+        },
+        "adaptiveDebounceMs": {
+          "label": "插嘴评估防抖（毫秒）",
+          "help": "群里安静这么久之后才开始评估要不要插嘴。默认 8000。"
+        },
+        "adaptiveJudgeMaxRetries": {
+          "label": "插嘴judge重试次数",
+          "help": "评估小模型调用失败时的重试次数。"
+        },
+        "adaptiveJudgeTimeoutMs": {
+          "label": "插嘴judge超时（毫秒）",
+          "help": "单次评估模型调用的超时时间。"
+        },
+        "adaptiveMaxPerHour": {
+          "label": "每小时插嘴上限",
+          "help": "每个群每小时最多自动插嘴几次，节流阀。"
+        },
+        "adaptiveNotifyUser": {
+          "label": "插嘴通知对象",
+          "help": "评估/插嘴事件额外通知的 QQ 号；默认通知第一个管理员。"
+        },
+        "adaptiveReframeAfterMs": {
+          "label": "插嘴框架重发间隔（毫秒）",
+          "help": "完整行为框架提醒至少多久重发一次，默认 24 小时。"
+        },
+        "adaptiveReframeEveryN": {
+          "label": "每N次注入重发框架",
+          "help": "兜底：每 N 次轻量注入强制重发一次完整框架。0=关闭。"
+        },
+        "adaptiveTrace": {
+          "label": "插嘴判定轨迹日志",
+          "help": "开启后记录每个候选消息的判定过程（QQAdaptive:trace）。"
+        },
+        "adaptiveWindowHardCap": {
+          "label": "插嘴窗口消息上限",
+          "help": "上下文窗口最多缓存多少条群消息。"
+        },
+        "adminOnlyChat": {
+          "label": "仅管理员可用",
+          "help": "开启后只有管理员列表里的 QQ 能触发机器人。"
+        },
+        "admins": {
+          "label": "管理员QQ号列表",
+          "help": "逗号分隔的 QQ 号；拥有会话命令与插嘴框架的权威身份。"
+        },
+        "allowedGroups": {
+          "label": "群白名单",
+          "help": "允许接入的群号列表；留空表示所有群。"
+        },
+        "antiRiskMode": {
+          "label": "风控规避模式",
+          "help": "规避 QQ 风控的发送样式（如 URL 处理）。"
+        },
+        "autoApproveRequests": {
+          "label": "自动批准执行请求",
+          "help": "节点/exec 审批自动通过（危险，默认关闭）。"
+        },
+        "blockedNotifyCooldownMs": {
+          "label": "拉黑提示冷却（毫秒）",
+          "help": "同一用户命中非管理员拦截提示的最小间隔，避免刷屏。"
+        },
+        "blockedUsers": {
+          "label": "封禁QQ号列表",
+          "help": "这些 QQ 号的消息直接忽略。"
+        },
+        "bubbleDelayMaxMs": {
+          "label": "气泡最长延迟（毫秒）",
+          "help": "拟人连发时气泡间延迟的上限。默认 4500。"
+        },
+        "bubbleDelayMinMs": {
+          "label": "气泡最短延迟（毫秒）",
+          "help": "拟人连发时气泡间延迟的下限。默认 800。"
+        },
+        "cacheInboundImagesToLocal": {
+          "label": "缓存入站图片到本地",
+          "help": "把 QQ 图片下载缓存，便于复读与视觉分析。默认开启。"
+        },
+        "deliverMidTurn": {
+          "label": "转发回合中评论",
+          "help": "开启后 commentary/中间文本也发到 QQ。默认关闭：只发最终回复（内核会把中途文本并入 final）。"
+        },
+        "emptyReplyFallbackText": {
+          "label": "空回复兜底文案",
+          "help": "模型没产出可见回复时发送的占位文本。"
+        },
+        "enableDeduplication": {
+          "label": "入站消息去重",
+          "help": "重复推送的同一条消息只处理一次。"
+        },
+        "enableDynamicModelCatalog": {
+          "label": "动态模型目录",
+          "help": "允许在会话内查询/切换可用模型清单。默认关闭。"
+        },
+        "enableEmptyReplyFallback": {
+          "label": "启用空回复兜底",
+          "help": "配合兜底文案使用；关闭后空回复保持静默。"
+        },
+        "enableErrorNotify": {
+          "label": "错误通知",
+          "help": "回合出错时向来源会话发送错误提示。"
+        },
+        "enableGuilds": {
+          "label": "启用频道（Guild）",
+          "help": "接入 OneBot 频道/子频道消息。"
+        },
+        "enableQueueNotify": {
+          "label": "排队提示",
+          "help": "消息进入合并队列时发送排队提示。默认关闭（静默合并体验更好）。"
+        },
+        "enableSessionLockRecovery": {
+          "label": "会话锁自愈",
+          "help": "检测到 stale 会话写锁时自动回收。默认开启。"
+        },
+        "enableTTS": {
+          "label": "启用语音消息",
+          "help": "允许发送 QQ 语音气泡。"
+        },
+        "formatMarkdown": {
+          "label": "清理Markdown格式",
+          "help": "QQ 不渲染 markdown，开启后剥除标记保留纯文本。"
+        },
+        "forwardNodeCharLimit": {
+          "label": "转发节点字符上限",
+          "help": "合并转发每个节点的最大字符数；0=不拆。"
+        },
+        "forwardNodeName": {
+          "label": "转发节点昵称",
+          "help": "合并转发里显示的发送者名。"
+        },
+        "historyLimit": {
+          "label": "历史消息条数",
+          "help": "注入上下文的近期历史消息数量。"
+        },
+        "includeCurrentOutline": {
+          "label": "回显当前消息概要",
+          "help": "默认关闭：当前消息已是模型输入，回显会双倍占 token。"
+        },
+        "includeSenderInLayers": {
+          "label": "上下文包含发送者",
+          "help": "层级上下文里是否带发送者昵称/QQ号。"
+        },
+        "maxCharsPerLayer": {
+          "label": "每层上下文最大字符",
+          "help": "每层（转发/引用/历史）注入上下文的字符上限。"
+        },
+        "maxForwardLayers": {
+          "label": "合并转发展开层数",
+          "help": "收到合并转发卡片时最多向下展开几层。"
+        },
+        "maxForwardMessagesPerLayer": {
+          "label": "每层转发展开条数",
+          "help": "合并转发每一层最多展开多少条消息。"
+        },
+        "maxReplyLayers": {
+          "label": "引用展开层数",
+          "help": "回复引用最多向下追溯几层。"
+        },
+        "maxTotalContextChars": {
+          "label": "上下文总字符上限",
+          "help": "所有附加层级上下文的总字符数封顶。"
+        },
+        "maxMessageLength": {
+          "label": "单条消息最大长度",
+          "help": "超过后强制拆断；humanizeBubbles 开启时它同时充当气泡粒度上限——超长段落先按句号、再按逗号断句，硬切只是最后兜底。"
+        },
+        "nonAdminBlockedMessage": {
+          "label": "非管理员拦截文案",
+          "help": "被拦截时回复的文本；留空则静默。"
+        },
+        "notifyNonAdminBlocked": {
+          "label": "提示被拦截的非管理员",
+          "help": "关闭后对非管理员完全静默。"
+        },
+        "outboundMediaBridgeToken": {
+          "label": "大文件桥接令牌",
+          "help": "与 I2DC bridge 服务共享的鉴权 token。"
+        },
+        "outboundMediaBridgeUrl": {
+          "label": "大文件桥接地址",
+          "help": "超过 OneBot payload 上限的文件先传到该服务再发文件消息。"
+        },
+        "processingPulseText": {
+          "label": "脉冲提示文案",
+          "help": "长回合期间发出的心跳提示文本。"
+        },
+        "processingStatusDelayMs": {
+          "label": "状态卡延迟（毫秒）",
+          "help": "回合运行多久之后才开始发处理中提示。"
+        },
+        "processingStatusIntervalMs": {
+          "label": "状态卡间隔（毫秒）",
+          "help": "处理中提示的最小重复间隔。"
+        },
+        "processingStatusText": {
+          "label": "处理中提示文案",
+          "help": "回合进行中发出的提示文本。"
+        },
+        "rateLimitMs": {
+          "label": "多段发送间隔（毫秒）",
+          "help": "非拟人路径下多条消息之间的固定间隔。建议 1000。"
+        },
+        "requireMention": {
+          "label": "群内必须@才回",
+          "help": "关闭后群里普通聊天也可能触发（配合插嘴策略使用）。"
+        },
+        "sharedMediaContainerDir": {
+          "label": "媒体共享目录（容器内）",
+          "help": "NapCat 容器内可见的共享落盘路径。"
+        },
+        "sharedMediaHostDir": {
+          "label": "媒体共享目录（宿主机）",
+          "help": "宿主机侧对应的实际路径。"
+        },
+        "systemPrompt": {
+          "label": "QQ 渠道系统提示",
+          "help": "追加给 QQ 会话的额外系统提示。"
+        },
+        "typingDelayMsPerChar": {
+          "label": "打字速度系数（毫秒/字）",
+          "help": "拟人连发的气泡间隔 = 上一条长度 × 本系数，再按最短/最长延迟夹取。默认 120。"
+        },
+        "stripTrailingPeriod": {
+          "label": "去掉气泡结尾句号",
+          "help": "默认开启。每条气泡结尾的单个。或 . 会被去掉，更像人打的字；结尾是 ... 或 。。。 这类连续点号时按省略号保留。"
+        },
+        "humanizeBubbles": {
+          "label": "拟人化分气泡",
+          "help": "回复按段落拆成多条气泡依次发送（段落超过单条消息最大长度时按句读断）。开启时长回复不再转合并转发卡。"
+        },
+        "wsUrl": {
+          "label": "OneBot WS 地址",
+          "help": "NapCat/OneBotv11 WebSocket 连接地址。"
         }
       }
     }
