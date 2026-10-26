@@ -3024,7 +3024,7 @@ function humanBubbleDelayMs(len: number, perCharMs: number, minMs: number, maxMs
 function resolveHumanizeOpts(cfg: any): { maxChars: number; perCharMs: number; minMs: number; maxMs: number } | undefined {
     if (!cfg || cfg.humanizeBubbles === false) return undefined;
     return {
-        maxChars: Math.max(20, Number(cfg.humanBubbleMaxChars) || 80),
+        maxChars: Math.max(20, Number(cfg.maxMessageLength) || 4000),
         perCharMs: Math.max(0, Number(cfg.typingDelayMsPerChar ?? 120)),
         minMs: Math.max(0, Number(cfg.bubbleDelayMinMs ?? 800)),
         maxMs: Math.max(100, Number(cfg.bubbleDelayMaxMs ?? 4500)),
@@ -3046,7 +3046,7 @@ async function sendQQTextMessage(params: {
         : null;
     const chunks = hum && hum.length > 1 ? hum : splitMessage(normalizedText, 4000);
     const useHumanDelay = Boolean(hum && hum.length > 1);
-    if (useHumanDelay) console.log(`[QQ] humanized sendText to=${params.to} bubbles=${hum!.length} maxChars=${params.humanize!.maxChars}`);
+    if (useHumanDelay) console.log(`[QQ] humanized sendText to=${params.to} bubbles=${hum!.length} maxChars=${params.humanize!.maxChars}(maxMessageLength)`);
     let lastAck: any = null;
     for (let i = 0; i < chunks.length; i += 1) {
         let message: OneBotMessage | string = chunks[i];
@@ -3379,7 +3379,239 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     label: "允许群聊裸 slash 指令",
                     help: "默认关闭。关闭后，/model 这类群聊指令需要配合关键词触发；如果想恢复旧体验再手动开启。",
                 },
-            },
+                            accessToken: {
+                    label: "OneBot 访问令牌",
+                    help: "需与 NapCat/OneBot 端配置一致；留空表示不鉴权。敏感信息，修改后需保存并重载。",
+                },
+                adaptiveDebounceMs: {
+                    label: "插嘴评估防抖（毫秒）",
+                    help: "群里安静这么久之后才开始评估要不要插嘴。默认 8000。",
+                },
+                adaptiveJudgeMaxRetries: {
+                    label: "插嘴judge重试次数",
+                    help: "评估小模型调用失败时的重试次数。",
+                },
+                adaptiveJudgeTimeoutMs: {
+                    label: "插嘴judge超时（毫秒）",
+                    help: "单次评估模型调用的超时时间。",
+                },
+                adaptiveMaxPerHour: {
+                    label: "每小时插嘴上限",
+                    help: "每个群每小时最多自动插嘴几次，节流阀。",
+                },
+                adaptiveNotifyUser: {
+                    label: "插嘴通知对象",
+                    help: "评估/插嘴事件额外通知的 QQ 号；默认通知第一个管理员。",
+                },
+                adaptiveReframeAfterMs: {
+                    label: "插嘴框架重发间隔（毫秒）",
+                    help: "完整行为框架提醒至少多久重发一次，默认 24 小时。",
+                },
+                adaptiveReframeEveryN: {
+                    label: "每N次注入重发框架",
+                    help: "兜底：每 N 次轻量注入强制重发一次完整框架。0=关闭。",
+                },
+                adaptiveTrace: {
+                    label: "插嘴判定轨迹日志",
+                    help: "开启后记录每个候选消息的判定过程（QQAdaptive:trace）。",
+                },
+                adaptiveWindowHardCap: {
+                    label: "插嘴窗口消息上限",
+                    help: "上下文窗口最多缓存多少条群消息。",
+                },
+                adminOnlyChat: {
+                    label: "仅管理员可用",
+                    help: "开启后只有管理员列表里的 QQ 能触发机器人。",
+                },
+                admins: {
+                    label: "管理员QQ号列表",
+                    help: "逗号分隔的 QQ 号；拥有会话命令与插嘴框架的权威身份。",
+                },
+                allowedGroups: {
+                    label: "群白名单",
+                    help: "允许接入的群号列表；留空表示所有群。",
+                },
+                antiRiskMode: {
+                    label: "风控规避模式",
+                    help: "规避 QQ 风控的发送样式（如 URL 处理）。",
+                },
+                autoApproveRequests: {
+                    label: "自动批准执行请求",
+                    help: "节点/exec 审批自动通过（危险，默认关闭）。",
+                },
+                blockedNotifyCooldownMs: {
+                    label: "拉黑提示冷却（毫秒）",
+                    help: "同一用户命中非管理员拦截提示的最小间隔，避免刷屏。",
+                },
+                blockedUsers: {
+                    label: "封禁QQ号列表",
+                    help: "这些 QQ 号的消息直接忽略。",
+                },
+                bubbleDelayMaxMs: {
+                    label: "气泡最长延迟（毫秒）",
+                    help: "拟人连发时气泡间延迟的上限。默认 4500。",
+                },
+                bubbleDelayMinMs: {
+                    label: "气泡最短延迟（毫秒）",
+                    help: "拟人连发时气泡间延迟的下限。默认 800。",
+                },
+                cacheInboundImagesToLocal: {
+                    label: "缓存入站图片到本地",
+                    help: "把 QQ 图片下载缓存，便于复读与视觉分析。默认开启。",
+                },
+                deliverMidTurn: {
+                    label: "转发回合中评论",
+                    help: "开启后 commentary/中间文本也发到 QQ。默认关闭：只发最终回复（内核会把中途文本并入 final）。",
+                },
+                emptyReplyFallbackText: {
+                    label: "空回复兜底文案",
+                    help: "模型没产出可见回复时发送的占位文本。",
+                },
+                enableDeduplication: {
+                    label: "入站消息去重",
+                    help: "重复推送的同一条消息只处理一次。",
+                },
+                enableDynamicModelCatalog: {
+                    label: "动态模型目录",
+                    help: "允许在会话内查询/切换可用模型清单。默认关闭。",
+                },
+                enableEmptyReplyFallback: {
+                    label: "启用空回复兜底",
+                    help: "配合兜底文案使用；关闭后空回复保持静默。",
+                },
+                enableErrorNotify: {
+                    label: "错误通知",
+                    help: "回合出错时向来源会话发送错误提示。",
+                },
+                enableGuilds: {
+                    label: "启用频道（Guild）",
+                    help: "接入 OneBot 频道/子频道消息。",
+                },
+                enableQueueNotify: {
+                    label: "排队提示",
+                    help: "消息进入合并队列时发送排队提示。默认关闭（静默合并体验更好）。",
+                },
+                enableSessionLockRecovery: {
+                    label: "会话锁自愈",
+                    help: "检测到 stale 会话写锁时自动回收。默认开启。",
+                },
+                enableTTS: {
+                    label: "启用语音消息",
+                    help: "允许发送 QQ 语音气泡。",
+                },
+                formatMarkdown: {
+                    label: "清理Markdown格式",
+                    help: "QQ 不渲染 markdown，开启后剥除标记保留纯文本。",
+                },
+                forwardNodeCharLimit: {
+                    label: "转发节点字符上限",
+                    help: "合并转发每个节点的最大字符数；0=不拆。",
+                },
+                forwardNodeName: {
+                    label: "转发节点昵称",
+                    help: "合并转发里显示的发送者名。",
+                },
+                historyLimit: {
+                    label: "历史消息条数",
+                    help: "注入上下文的近期历史消息数量。",
+                },
+                includeCurrentOutline: {
+                    label: "回显当前消息概要",
+                    help: "默认关闭：当前消息已是模型输入，回显会双倍占 token。",
+                },
+                includeSenderInLayers: {
+                    label: "上下文包含发送者",
+                    help: "层级上下文里是否带发送者昵称/QQ号。",
+                },
+                maxCharsPerLayer: {
+                    label: "每层上下文最大字符",
+                    help: "每层（转发/引用/历史）注入上下文的字符上限。",
+                },
+                maxForwardLayers: {
+                    label: "合并转发展开层数",
+                    help: "收到合并转发卡片时最多向下展开几层。",
+                },
+                maxForwardMessagesPerLayer: {
+                    label: "每层转发展开条数",
+                    help: "合并转发每一层最多展开多少条消息。",
+                },
+                maxReplyLayers: {
+                    label: "引用展开层数",
+                    help: "回复引用最多向下追溯几层。",
+                },
+                maxTotalContextChars: {
+                    label: "上下文总字符上限",
+                    help: "所有附加层级上下文的总字符数封顶。",
+                },
+                maxMessageLength: {
+                    label: "单条消息最大长度",
+                    help: "超过后强制拆断；humanizeBubbles 开启时它同时充当气泡粒度上限——超长段落先按句号、再按逗号断句，硬切只是最后兜底。",
+                },
+                nonAdminBlockedMessage: {
+                    label: "非管理员拦截文案",
+                    help: "被拦截时回复的文本；留空则静默。",
+                },
+                notifyNonAdminBlocked: {
+                    label: "提示被拦截的非管理员",
+                    help: "关闭后对非管理员完全静默。",
+                },
+                outboundMediaBridgeToken: {
+                    label: "大文件桥接令牌",
+                    help: "与 I2DC bridge 服务共享的鉴权 token。",
+                },
+                outboundMediaBridgeUrl: {
+                    label: "大文件桥接地址",
+                    help: "超过 OneBot payload 上限的文件先传到该服务再发文件消息。",
+                },
+                processingPulseText: {
+                    label: "脉冲提示文案",
+                    help: "长回合期间发出的心跳提示文本。",
+                },
+                processingStatusDelayMs: {
+                    label: "状态卡延迟（毫秒）",
+                    help: "回合运行多久之后才开始发处理中提示。",
+                },
+                processingStatusIntervalMs: {
+                    label: "状态卡间隔（毫秒）",
+                    help: "处理中提示的最小重复间隔。",
+                },
+                processingStatusText: {
+                    label: "处理中提示文案",
+                    help: "回合进行中发出的提示文本。",
+                },
+                rateLimitMs: {
+                    label: "多段发送间隔（毫秒）",
+                    help: "非拟人路径下多条消息之间的固定间隔。建议 1000。",
+                },
+                requireMention: {
+                    label: "群内必须@才回",
+                    help: "关闭后群里普通聊天也可能触发（配合插嘴策略使用）。",
+                },
+                sharedMediaContainerDir: {
+                    label: "媒体共享目录（容器内）",
+                    help: "NapCat 容器内可见的共享落盘路径。",
+                },
+                sharedMediaHostDir: {
+                    label: "媒体共享目录（宿主机）",
+                    help: "宿主机侧对应的实际路径。",
+                },
+                systemPrompt: {
+                    label: "QQ 渠道系统提示",
+                    help: "追加给 QQ 会话的额外系统提示。",
+                },
+                typingDelayMsPerChar: {
+                    label: "打字速度系数（毫秒/字）",
+                    help: "拟人连发的气泡间隔 = 上一条长度 × 本系数，再按最短/最长延迟夹取。默认 120。",
+                },
+                humanizeBubbles: {
+                    label: "拟人化分气泡",
+                    help: "回复按段落拆成多条气泡依次发送（段落超过单条消息最大长度时按句读断）。开启时长回复不再转合并转发卡。",
+                },
+                wsUrl: {
+                    label: "OneBot WS 地址",
+                    help: "NapCat/OneBotv11 WebSocket 连接地址。",
+                },
+},
         };
     })(),
     config: {
@@ -4571,7 +4803,7 @@ ${current}
                         const humOpts = resolveHumanizeOpts(config);
                         const canHumanize = Boolean(humOpts) && !/\[CQ:/.test(processed) && (processed.trim().length > humOpts!.maxChars || /\n\s*\n/.test(processed));
                         const chunks = canHumanize ? splitIntoHumanBubbles(processed, humOpts!.maxChars) : splitMessage(processed, config.maxMessageLength || 4000);
-                        if (canHumanize && chunks.length > 1) console.log(`[QQ] humanized reply bubbles=${chunks.length} maxChars=${humOpts!.maxChars} group=${groupId || userId}`);
+                        if (canHumanize && chunks.length > 1) console.log(`[QQ] humanized reply bubbles=${chunks.length} maxChars=${humOpts!.maxChars}(maxMessageLength) group=${groupId || userId}`);
                         for (let i = 0; i < chunks.length; i++) {
                             if (currentRunState?.isStale()) return i > 0;
                             let chunk = chunks[i];
