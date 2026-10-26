@@ -3021,6 +3021,18 @@ function humanBubbleDelayMs(len: number, perCharMs: number, minMs: number, maxMs
     return Math.max(minMs, Math.min(maxMs, Math.round(len * perCharMs)));
 }
 
+function stripTrailingPeriod(text: string): string {
+    const t = text.trimEnd();
+    if (!t) return text;
+    if (/[。．.]{2,}$/.test(t)) return text;
+    if (t.endsWith("。")) return t.slice(0, -1).trimEnd();
+    if (t.endsWith(".")) {
+        const prev = t[t.length - 2];
+        if (!prev || !/[0-9a-zA-Z]/.test(prev)) return t.slice(0, -1).trimEnd();
+    }
+    return text;
+}
+
 function resolveHumanizeOpts(cfg: any): { maxChars: number; perCharMs: number; minMs: number; maxMs: number } | undefined {
     if (!cfg || cfg.humanizeBubbles === false) return undefined;
     return {
@@ -3038,6 +3050,7 @@ async function sendQQTextMessage(params: {
     replyToId?: string | null;
     delayBetweenChunksMs?: number;
     humanize?: { maxChars: number; perCharMs: number; minMs: number; maxMs: number };
+    stripPeriod?: boolean;
 }): Promise<any> {
     const normalizedText = await resolveInlineCqRecord(params.text || "");
     if (!normalizedText.trim()) return null;
@@ -3049,9 +3062,10 @@ async function sendQQTextMessage(params: {
     if (useHumanDelay) console.log(`[QQ] humanized sendText to=${params.to} bubbles=${hum!.length} maxChars=${params.humanize!.maxChars}(maxMessageLength)`);
     let lastAck: any = null;
     for (let i = 0; i < chunks.length; i += 1) {
-        let message: OneBotMessage | string = chunks[i];
+        const body = params.stripPeriod && !chunks[i].includes("[CQ:") ? stripTrailingPeriod(chunks[i]) : chunks[i];
+        let message: OneBotMessage | string = body;
         if (params.replyToId && i === 0) {
-            message = [{ type: "reply", data: { id: String(params.replyToId) } }, { type: "text", data: { text: chunks[i] } }];
+            message = [{ type: "reply", data: { id: String(params.replyToId) } }, { type: "text", data: { text: body } }];
         }
         const ack = await sendOneBotMessageWithAck(params.client, params.to, message);
         if (!ack.ok) throw new Error(ack.error || "Failed to send text");
@@ -3602,6 +3616,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 typingDelayMsPerChar: {
                     label: "打字速度系数（毫秒/字）",
                     help: "拟人连发的气泡间隔 = 上一条长度 × 本系数，再按最短/最长延迟夹取。默认 120。",
+                },
+                stripTrailingPeriod: {
+                    label: "去掉气泡结尾句号",
+                    help: "默认开启。每条气泡结尾的单个。或 . 会被去掉，更像人打的字；结尾是 ... 或 。。。 这类连续点号时按省略号保留。",
                 },
                 humanizeBubbles: {
                     label: "拟人化分气泡",
@@ -4816,6 +4834,8 @@ ${current}
                                 }
                             }
 
+                            if (config.stripTrailingPeriod !== false && !chunk.includes("[CQ:")) chunk = stripTrailingPeriod(chunk);
+
                             if (isGroup) client.sendGroupMsg(groupId, chunk);
                             else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, chunk);
                             else client.sendPrivateMsg(userId, chunk);
@@ -5745,7 +5765,7 @@ ${current}
         sendText: async ({ to, text, accountId, replyToId }) => {
             const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
             if (!client) throw new Error("QQ client not connected");
-            const lastAck = await sendQQTextMessage({ client, to, text, replyToId, humanize: resolveHumanizeOpts(accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID)) });
+            const lastAck = await sendQQTextMessage({ client, to, text, replyToId, humanize: resolveHumanizeOpts(accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID)), stripPeriod: accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID)?.stripTrailingPeriod !== false });
             return {
                 channel: "qq",
                 messageId: resolveOutboundMessageId(lastAck),
