@@ -2875,6 +2875,20 @@ async function resolveInlineCqRecord(text: string): Promise<string> {
     return result;
 }
 
+const recentOutboundDeliveries = new Map<string, number>();
+function noteOutboundDelivery(to: string) {
+    const key = /^(group|guild):/.test(to) ? to : `dm:${to}`;
+    const now = Date.now();
+    recentOutboundDeliveries.set(key, now);
+    if (recentOutboundDeliveries.size > 200) {
+        for (const [k, t] of recentOutboundDeliveries) if (now - t > 3_600_000) recentOutboundDeliveries.delete(k);
+    }
+}
+function hadRecentOutbound(key: string, sinceMs: number): boolean {
+    const t = recentOutboundDeliveries.get(key);
+    return typeof t === "number" && t >= sinceMs;
+}
+
 function isWorkshopLearnedNotice(message: OneBotMessage | string): boolean {
     const text = typeof message === "string"
         ? message
@@ -2897,12 +2911,14 @@ async function sendOneBotMessageWithAck(client: OneBotClient, to: string, messag
     try {
         if (to.startsWith("group:")) {
             const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message, timeoutMs);
+            noteOutboundDelivery(to);
             return { ok: true, data };
         }
         if (to.startsWith("guild:")) {
             const parts = to.split(":");
             if (parts.length >= 3) {
                 const data = await client.sendGuildChannelMsgAck(parts[1], parts[2], message, timeoutMs);
+                noteOutboundDelivery(to);
                 return { ok: true, data };
             }
             return { ok: false, error: `Invalid guild target: ${to}` };
@@ -2912,6 +2928,7 @@ async function sendOneBotMessageWithAck(client: OneBotClient, to: string, messag
             return { ok: false, error: `Invalid private target: ${to}` };
         }
         const data = await client.sendPrivateMsgAck(userId, message, timeoutMs);
+        noteOutboundDelivery(to);
         return { ok: true, data };
     } catch (err) {
         return { ok: false, error: String(err) };
@@ -5463,6 +5480,21 @@ ${current}
                                                 lowerErrMessage.includes("timed out") || lowerErrMessage.includes("timeout") ||
                                                 lowerErrMessage.includes("500") || lowerErrMessage.includes("502") || lowerErrMessage.includes("503") || lowerErrMessage.includes("529");
                                             if (!retryClassifiedError && errorSurfacedFinalTexts.length > 0) {
+                                                // Outbound-aware silence (dad, Oct 26): kernel does not count
+                                                // out-of-band sends (script voice via gateway call → our own
+                                                // outbound path) as this turn's reply, so a voice-only turn
+                                                // closed with NO_REPLY surfaces "I finished the turn but no
+                                                // visible reply". If WE delivered something to this exact
+                                                // target during this turn, the user-visible work is done —
+                                                // swallow the error bubble instead of spamming the chat.
+                                                const silenceTargetKey = isGroup ? `group:${groupId}` : isGuild ? `guild:${guildId}:${channelId}` : `dm:${userId}`;
+                                                if (/did not produce a visible reply|finished the turn, but it did not/i.test(errMessage) && hadRecentOutbound(silenceTargetKey, inboundReceivedAt - 2000)) {
+                                                    errorSurfacedFinalTexts.splice(0);
+                                                    deliveredAnything = true;
+                                                    sawReplyContent = true;
+                                                    console.log(`[QQ] no-visible-reply error suppressed: outbound delivery to ${silenceTargetKey} observed this turn (outbound-aware silence)`);
+                                                    break out_loop;
+                                                }
                                                 for (const surfacedText of errorSurfacedFinalTexts.splice(0)) {
                                                     if (runState.isStale()) break;
                                                     const processed = await prepareOutgoingText(surfacedText);
