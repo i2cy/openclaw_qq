@@ -446,8 +446,8 @@
             "type": "boolean"
           },
           "typingDelayMsPerChar": {
-            "description": "humanizeBubbles 气泡间延迟 = 上一条气泡长度 × 本比例（毫秒/字符），即打字速度系数。",
-            "default": 120,
+            "description": "humanizeBubbles 气泡间延迟 = 下一条消息的加权长度（中文计2、英文计1）× 本系数（毫秒/加权字节），再按最短/最长延迟夹取。默认 280 ≈ 中文 85 字/分、英文 45 词/分的人类打字速度。",
+            "default": 280,
             "type": "number"
           },
           "stripTrailingPeriod": {
@@ -461,8 +461,8 @@
             "type": "number"
           },
           "bubbleDelayMaxMs": {
-            "description": "气泡间最长延迟（毫秒）。默认 4500。",
-            "default": 4500,
+            "description": "气泡间最长延迟（毫秒）。默认 12000——保证长气泡仍体现字数比例；嫌慢可回调到 4500。",
+            "default": 12000,
             "type": "number"
           },
           "forwardNodeCharLimit": {
@@ -750,7 +750,7 @@
         },
         "bubbleDelayMaxMs": {
           "label": "气泡最长延迟（毫秒）",
-          "help": "拟人连发时气泡间延迟的上限。默认 4500。"
+          "help": "拟人连发时气泡间延迟的上限。默认 12000（让长气泡保持字数比例感）；嫌慢可调回 4500。"
         },
         "bubbleDelayMinMs": {
           "label": "气泡最短延迟（毫秒）",
@@ -901,8 +901,8 @@
           "help": "追加给 QQ 会话的额外系统提示。"
         },
         "typingDelayMsPerChar": {
-          "label": "打字速度系数（毫秒/字）",
-          "help": "拟人连发的气泡间隔 = 上一条长度 × 本系数，再按最短/最长延迟夹取。默认 120。"
+          "label": "打字速度系数（毫秒/加权字节）",
+          "help": "气泡间隔 = 下一条消息的加权长度（中文计 2、英文计 1）× 本系数，再按最短/最长延迟夹取。默认 280 ≈ 中文 85 字/分、英文 45 词/分的人类打字速度。"
         },
         "stripTrailingPeriod": {
           "label": "去掉气泡结尾句号",

@@ -3034,8 +3034,17 @@ function splitIntoHumanBubbles(text: string, maxChars: number): string[] {
     return bubbles.filter(b => b.trim());
 }
 
-function humanBubbleDelayMs(len: number, perCharMs: number, minMs: number, maxMs: number): number {
-    return Math.max(minMs, Math.min(maxMs, Math.round(len * perCharMs)));
+function weightedMsgLen(text: string): number {
+    let units = 0;
+    for (const ch of text) {
+        const cp = ch.codePointAt(0) || 0;
+        units += cp > 0x2e80 ? 2 : 1; // CJK/fullwidth ~ 2 bytes, latin ~ 1
+    }
+    return units;
+}
+
+function humanBubbleDelayMs(nextText: string, perCharMs: number, minMs: number, maxMs: number): number {
+    return Math.max(minMs, Math.min(maxMs, Math.round(weightedMsgLen(nextText) * perCharMs)));
 }
 
 function stripTrailingPeriod(text: string): string {
@@ -3089,7 +3098,7 @@ async function sendQQTextMessage(params: {
         lastAck = ack.data;
         if (i < chunks.length - 1) {
             await sleep(useHumanDelay
-                ? humanBubbleDelayMs(chunks[i].length, params.humanize!.perCharMs, params.humanize!.minMs, params.humanize!.maxMs)
+                ? humanBubbleDelayMs(chunks[i + 1], params.humanize!.perCharMs, params.humanize!.minMs, params.humanize!.maxMs)
                 : (params.delayBetweenChunksMs ?? 1000));
         }
     }
@@ -3480,7 +3489,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 },
                 bubbleDelayMaxMs: {
                     label: "气泡最长延迟（毫秒）",
-                    help: "拟人连发时气泡间延迟的上限。默认 4500。",
+                    help: "拟人连发时气泡间延迟的上限。默认 12000（让长气泡保持字数比例感）；嫌慢可调回 4500。",
                 },
                 bubbleDelayMinMs: {
                     label: "气泡最短延迟（毫秒）",
@@ -3631,8 +3640,8 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     help: "追加给 QQ 会话的额外系统提示。",
                 },
                 typingDelayMsPerChar: {
-                    label: "打字速度系数（毫秒/字）",
-                    help: "拟人连发的气泡间隔 = 上一条长度 × 本系数，再按最短/最长延迟夹取。默认 120。",
+                    label: "打字速度系数（毫秒/加权字节）",
+                    help: "气泡间隔 = 下一条消息的加权长度（中文计 2、英文计 1）× 本系数，再按最短/最长延迟夹取。默认 280 ≈ 中文 85 字/分、英文 45 词/分的人类打字速度。",
                 },
                 stripTrailingPeriod: {
                     label: "去掉气泡结尾句号",
@@ -4866,7 +4875,7 @@ ${current}
                             }
 
                             if (i < chunks.length - 1) {
-                                if (canHumanize) await sleep(humanBubbleDelayMs(chunks[i].length, humOpts!.perCharMs, humOpts!.minMs, humOpts!.maxMs));
+                                if (canHumanize) await sleep(humanBubbleDelayMs(chunks[i + 1], humOpts!.perCharMs, humOpts!.minMs, humOpts!.maxMs));
                                 else if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                             }
                         }

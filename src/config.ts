@@ -159,10 +159,10 @@ export const QQConfigSchema = z.object({
   forwardLongReplyThreshold: NumberInputSchema(300).describe("final_answer 长回复自动转为 QQ 合并转发的阈值（字符数）。默认 300；commentary 仍按普通消息发送。"),
   deliverMidTurn: BooleanInputSchema(false).describe("是否把 commentary/unknown 等 mid-turn 文本转发到 QQ。默认 false：只发 final_answer（内核会把中途攒下的文本并进 final）。"),
   humanizeBubbles: BooleanInputSchema(true).describe("按段落拆成多条气泡分别发送，模拟人类连发（含主动 sendText）。单段超过 maxMessageLength 时按句号/逗号断句。开启时 final 长回复不再转合并转发卡。"),
-  typingDelayMsPerChar: NumberInputSchema(120).describe("humanizeBubbles 气泡间延迟 = 上一条气泡长度 × 本比例（毫秒/字符），即打字速度系数。"),
+  typingDelayMsPerChar: NumberInputSchema(280).describe("humanizeBubbles 气泡间延迟 = 下一条消息的加权长度（中文计2、英文计1）× 本系数（毫秒/加权字节），再按最短/最长延迟夹取。默认 280 ≈ 中文 85 字/分、英文 45 词/分的人类打字速度。"),
   stripTrailingPeriod: BooleanInputSchema(true).describe("去掉每条气泡结尾的单个句号（。或.），更口语化；结尾连续点号（... / 。。。）视为省略号原样保留。"),
   bubbleDelayMinMs: NumberInputSchema(800).describe("气泡间最短延迟（毫秒）。默认 800。"),
-  bubbleDelayMaxMs: NumberInputSchema(4500).describe("气泡间最长延迟（毫秒）。默认 4500。"),
+  bubbleDelayMaxMs: NumberInputSchema(12000).describe("气泡间最长延迟（毫秒）。默认 12000——保证长气泡仍体现字数比例；嫌慢可回调到 4500。"),
   forwardNodeCharLimit: NumberInputSchema(0).describe("启用长回复合并转发时，每个转发节点的最大字符数。默认 0，表示不按长度拆节点；同一轮回复的多条 assistant message 会尽量合并进一个转发。"),
   forwardNodeName: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("OpenClaw")).describe("启用长回复合并转发时，节点显示昵称。默认 OpenClaw。"),
 }).passthrough();
