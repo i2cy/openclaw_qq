@@ -2876,8 +2876,11 @@ async function resolveInlineCqRecord(text: string): Promise<string> {
 }
 
 const recentOutboundDeliveries = new Map<string, number>();
+function nowMs(ms: number): string { return new Date(ms).toTimeString().slice(0, 8); }
+
 function noteOutboundDelivery(to: string) {
-    const key = /^(group|guild):/.test(to) ? to : `dm:${to}`;
+    const userForm = /^user:(.+)$/.exec(to);
+    const key = userForm ? `dm:${userForm[1]}` : /^(group|guild):/.test(to) ? to : `dm:${to}`;
     const now = Date.now();
     recentOutboundDeliveries.set(key, now);
     if (recentOutboundDeliveries.size > 200) {
@@ -2885,8 +2888,12 @@ function noteOutboundDelivery(to: string) {
     }
 }
 function hadRecentOutbound(key: string, sinceMs: number): boolean {
-    const t = recentOutboundDeliveries.get(key);
-    return typeof t === "number" && t >= sinceMs;
+    const candidates = key.startsWith("dm:") ? [key, `dm:user:${key.slice(3)}`] : [key];
+    for (const candidate of candidates) {
+        const t = recentOutboundDeliveries.get(candidate);
+        if (typeof t === "number" && t >= sinceMs) return true;
+    }
+    return false;
 }
 
 function isWorkshopLearnedNotice(message: OneBotMessage | string): boolean {
@@ -5496,12 +5503,19 @@ ${current}
                                                 // visible reply". If WE delivered something to this exact
                                                 // target during this turn, the user-visible work is done —
                                                 // swallow the error bubble instead of spamming the chat.
-                                                const silenceTargetKey = isGroup ? `group:${groupId}` : isGuild ? `guild:${guildId}:${channelId}` : `dm:${userId}`;
-                                                if (/did not produce a visible reply|finished the turn, but it did not/i.test(errMessage) && hadRecentOutbound(silenceTargetKey, inboundReceivedAt - 2000)) {
+                                                const silenceKeys = new Set<string>([isGroup ? `group:${groupId}` : isGuild ? `guild:${guildId}:${channelId}` : `dm:${userId}`]);
+                                                // Synthetic turns (CLI agent call / session-bound cron announce) can reach this
+                                                // branch without userId/groupId populated - parse the route key too.
+                                                const routeTail = /:(direct|group):([^:]+)$/.exec(String(route?.sessionKey || ""));
+                                                if (routeTail) silenceKeys.add(routeTail[1] === "direct" ? `dm:${routeTail[2]}` : `group:${routeTail[2]}`);
+                                                const noVisibleReplyCopy = /did not produce a visible reply|finished the turn, but it did not/i.test(errMessage);
+                                                const hadOutboundThisTurn = noVisibleReplyCopy && [...silenceKeys].some((k) => hadRecentOutbound(k, inboundReceivedAt - 2000));
+                                                if (noVisibleReplyCopy) console.log(`[QQ] silence-check keys=${[...silenceKeys].join("|")} had=${hadOutboundThisTurn} since=${inboundReceivedAt} known=${[...recentOutboundDeliveries.entries()].map(([k, v]) => k + "@" + nowMs(v)).join(",")}`);
+                                                if (noVisibleReplyCopy && hadOutboundThisTurn) {
                                                     errorSurfacedFinalTexts.splice(0);
                                                     deliveredAnything = true;
                                                     sawReplyContent = true;
-                                                    console.log(`[QQ] no-visible-reply error suppressed: outbound delivery to ${silenceTargetKey} observed this turn (outbound-aware silence)`);
+                                                    console.log(`[QQ] no-visible-reply error suppressed: outbound delivery to ${[...silenceKeys].join("|")} observed this turn (outbound-aware silence)`);
                                                     break out_loop;
                                                 }
                                                 for (const surfacedText of errorSurfacedFinalTexts.splice(0)) {
