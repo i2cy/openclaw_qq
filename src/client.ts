@@ -168,7 +168,7 @@ export class OneBotClient extends EventEmitter {
     this.scheduleReconnect();
   }
 
-  private dispatchInboundEvent(payload: OneBotEvent) {
+  private async dispatchInboundEvent(payload: OneBotEvent) {
     if (payload.post_type === "meta_event" && payload.meta_event_type === "heartbeat") {
       this.emit("heartbeat", payload);
       return;
@@ -189,14 +189,25 @@ export class OneBotClient extends EventEmitter {
         (payload as any).target_id !== undefined &&
         String((payload as any).target_id) === String((payload as any).self_id ?? this.selfId)
       ) {
+        const pokeUid = String((payload as any).user_id ?? "");
+        const pokeGid = (payload as any).group_id;
+        let pokeName = "";
+        try {
+          const info = pokeGid !== undefined
+            ? await this.getGroupMemberInfo(Number(pokeGid), Number(pokeUid))
+            : await this.getStrangerInfo(Number(pokeUid));
+          pokeName = String(info?.card || info?.remark || info?.nick || info?.nickname || "").trim();
+        } catch { /* fall back to uid below */ }
+        if (!pokeName) pokeName = pokeUid || "someone";
+        const pokeText = `[动作] ${pokeName} 戳了你一下`;
         const pokePayload: Record<string, any> = {
           ...payload,
           post_type: "message",
           message_type: (payload as any).group_id ? "group" : "private",
           user_id: (payload as any).user_id,
-          sender: { user_id: (payload as any).user_id, nickname: "", card: "" },
-          message: [{ type: "text", data: { text: "[动作] 用户戳了你一下" } }],
-          raw_message: "[动作] 用户戳了你一下",
+          sender: { user_id: (payload as any).user_id, nickname: pokeName, card: pokeName },
+          message: [{ type: "text", data: { text: pokeText } }],
+          raw_message: pokeText,
           message_id: undefined,
         };
         this.emit("message", pokePayload as any);
@@ -223,6 +234,14 @@ export class OneBotClient extends EventEmitter {
 
   sendPrivateMsg(userId: number, message: OneBotMessage | string) {
     this.send("send_private_msg", { user_id: userId, message });
+  }
+
+  async getGroupMemberInfo(groupId: number, userId: number, timeoutMs: number = 6000): Promise<any> {
+    return this.sendWithResponse("get_group_member_info", { group_id: groupId, user_id: userId, no_cache: false }, timeoutMs);
+  }
+
+  async getStrangerInfo(userId: number, timeoutMs: number = 6000): Promise<any> {
+    return this.sendWithResponse("get_stranger_info", { user_id: userId, no_cache: false }, timeoutMs);
   }
 
   async sendPrivateMsgAck(userId: number, message: OneBotMessage | string, timeoutMs: number = 15000): Promise<any> {

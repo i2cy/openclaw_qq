@@ -4008,9 +4008,23 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
                     if (event.post_type === "notice" && event.notice_type === "notify" && event.sub_type === "poke") {
                         if (String(event.target_id) === String(client.getSelfId())) {
+                            const pokeUid = String(event.user_id ?? "");
+                            const pokeGidKey = String(event.group_id || "dm");
+                            let pokeName = getCachedMemberName(pokeGidKey, pokeUid) || "";
+                            if (!pokeName) {
+                                try {
+                                    const info = event.group_id
+                                        ? await client.getGroupMemberInfo(Number(event.group_id), Number(pokeUid))
+                                        : await client.getStrangerInfo(Number(pokeUid));
+                                    pokeName = String(info?.card || info?.remark || info?.nick || info?.nickname || "").trim();
+                                    if (pokeName) setCachedMemberName(pokeGidKey, pokeUid, pokeName);
+                                } catch { /* fall back to uid */ }
+                            }
+                            if (!pokeName) pokeName = pokeUid || "someone";
+                            event.sender = { ...(event.sender || {}), user_id: event.user_id, nickname: pokeName, card: pokeName };
                             event.post_type = "message";
                             event.message_type = event.group_id ? "group" : "private";
-                            event.raw_message = `[动作] 用户戳了你一下`;
+                            event.raw_message = `[动作] ${pokeName} 戳了你一下`;
                             event.message = [{ type: "text", data: { text: event.raw_message } }];
                         } else return;
                     }
@@ -4625,7 +4639,7 @@ ${current}
                     }
 
                     const keywordOnlyTrigger = Boolean(config.keywordOnlyTrigger) && isGroup;
-                    let isTriggered = forceTriggered || !isGroup || adaptiveSynthetic || text.includes("[动作] 用户戳了你一下");
+                    let isTriggered = forceTriggered || !isGroup || adaptiveSynthetic || /\[动作\][\s\S]{0,32}戳了/.test(text);
                     let keywordTriggered = false;
                     if (!isTriggered && keywordTriggers.length > 0) {
                         for (const kw of keywordTriggers) {
@@ -5679,7 +5693,7 @@ ${current}
                                 if (requeueCount <= REQUEUE_MAX && requeueBackoffMs !== undefined) {
                                     (mergedCtx as any).__qqRequeueCount = requeueCount;
                                     if (requeueCount === 1) {
-                                        const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试（最长约 8 分钟），不用重发。";
+                                        const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试（最长约一刻钟），不用重发。";
                                         console.log(`[QQ] dispatch hit transient session settle; scheduling long-tail requeue (attempt 1/${REQUEUE_MAX})`);
                                         if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${noticeText}`);
                                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, noticeText);
@@ -5704,9 +5718,9 @@ ${current}
                                         const tryDrain = () => {
                                             drainTries += 1;
                                             const st = sessionQueues.get(route.sessionKey);
-                                            if (!st || drainTries > 12) {
+                                            if (!st || drainTries > 90) {
                                                 console.warn(`[QQ] requeue drain gave up sess=${route.sessionKey} reason=${!st ? "state-vanished" : "busy>120s"}`);
-                                                const busyLostText = "⚠️ 上一轮持续忙碌超时（约 2 分钟），这条消息没能自动补上——请再发一次。";
+                                                const busyLostText = "⚠️ 上一轮持续忙碌超过一刻钟，这条消息没能自动补上——请再发一次。";
                                                 try {
                                                     if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${busyLostText}`);
                                                     else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, busyLostText);
