@@ -5709,11 +5709,13 @@ ${current}
                                 if (requeueCount <= REQUEUE_MAX && requeueBackoffMs !== undefined) {
                                     (mergedCtx as any).__qqRequeueCount = requeueCount;
                                     if (requeueCount === 1) {
-                                        const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试（最长约一刻钟），不用重发。";
                                         console.log(`[QQ] dispatch hit transient session settle; scheduling long-tail requeue (attempt 1/${REQUEUE_MAX})`);
-                                        if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${noticeText}`);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, noticeText);
-                                        else client.sendPrivateMsg(userId, noticeText);
+                                        if (config.enableQueueNotify !== false) {
+                                            const noticeText = "⏳ 上一轮还在收尾，这条消息会自动排队重试，不用重发。";
+                                            if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${noticeText}`);
+                                            else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, noticeText);
+                                            else client.sendPrivateMsg(userId, noticeText);
+                                        }
                                     }
                                     const attempt = requeueCount;
                                     console.log(`[QQ] requeueing payload sess=${route.sessionKey} attempt=${attempt}/${REQUEUE_MAX} backoff=${requeueBackoffMs}ms`);
@@ -5731,17 +5733,33 @@ ${current}
                                         // Retry drain until the session accepts the payload. A drain
                                         // already in flight (new message arrived meanwhile) merges it.
                                         let drainTries = 0;
+                                        // Dad (Oct 31): never ask the user to resend. Each drain round
+                                        // gets a ~15min busy budget; on exhaustion we silently re-arm a
+                                        // fresh round every 60s, up to 30 minutes total from the first
+                                        // settle-rejection. Only then drop (logged; notice if opted in).
+                                        const requeueFirstAt = Number((mergedCtx as any).__qqRequeueFirstAt) || Date.now();
+                                        (mergedCtx as any).__qqRequeueFirstAt = requeueFirstAt;
+                                        const REQUEUE_ABSOLUTE_MS = 30 * 60000;
                                         const tryDrain = () => {
                                             drainTries += 1;
                                             const st = sessionQueues.get(route.sessionKey);
                                             if (!st || drainTries > 90) {
-                                                console.warn(`[QQ] requeue drain gave up sess=${route.sessionKey} reason=${!st ? "state-vanished" : "busy>120s"}`);
-                                                const busyLostText = "⚠️ 上一轮持续忙碌超过一刻钟，这条消息没能自动补上——请再发一次。";
-                                                try {
-                                                    if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${busyLostText}`);
-                                                    else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, busyLostText);
-                                                    else client.sendPrivateMsg(userId, busyLostText);
-                                                } catch { /* best-effort notice */ }
+                                                const elapsedMs = Date.now() - requeueFirstAt;
+                                                if (elapsedMs < REQUEUE_ABSOLUTE_MS) {
+                                                    console.warn(`[QQ] requeue drain round exhausted (reason=${!st ? "state-vanished" : "busy"}); auto re-arming in 60s (elapsed ${Math.round(elapsedMs / 60000)}min)`);
+                                                    drainTries = 0;
+                                                    setTimeout(tryDrain, 60000);
+                                                    return;
+                                                }
+                                                console.warn(`[QQ] requeue gave up after ${Math.round((Date.now() - requeueFirstAt) / 60000)}min of auto-retries sess=${route.sessionKey} reason=${!st ? "state-vanished" : "busy"}`);
+                                                if (config.enableQueueNotify !== false) {
+                                                    const busyLostText = "⚠️ 上一轮持续忙碌超过半小时，这条消息最终没能自动补上。";
+                                                    try {
+                                                        if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${busyLostText}`);
+                                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, busyLostText);
+                                                        else client.sendPrivateMsg(userId, busyLostText);
+                                                    } catch { /* best-effort notice */ }
+                                                }
                                                 return;
                                             }
                                             if (!st.isProcessing) {
@@ -5760,11 +5778,29 @@ ${current}
                                         tryDrain();
                                     }, requeueBackoffMs);
                                 } else {
-                                    const lostText = "⚠️ 上一轮收尾超时（约 8 分钟），这条消息没能自动补上——请再发一次。";
-                                    console.warn(`[QQ] requeue budget exhausted for sess=${route.sessionKey}; notifying user.`);
-                                    if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${lostText}`);
-                                    else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostText);
-                                    else client.sendPrivateMsg(userId, lostText);
+                                    // Backoff ladder walked: keep hammering at the slowest step until
+                                    // the 30-minute absolute budget runs out — silent, self-healing.
+                                    const elapsedMs = Date.now() - (Number((mergedCtx as any).__qqRequeueFirstAt) || Date.now());
+                                    (mergedCtx as any).__qqRequeueFirstAt = (mergedCtx as any).__qqRequeueFirstAt || Date.now();
+                                    if (elapsedMs < 30 * 60000) {
+                                        (mergedCtx as any).__qqRequeueCount = REQUEUE_MAX - 1;
+                                        console.warn(`[QQ] requeue ladder walked; holding at max backoff (elapsed ${Math.round(elapsedMs / 60000)}min)`);
+                                        setTimeout(() => {
+                                            const stHold = sessionQueues.get(route.sessionKey) ?? { pendingPayloads: [], timer: null, isProcessing: false, latestEpoch: 0, activeEpoch: 0 } as any;
+                                            sessionQueues.set(route.sessionKey, stHold);
+                                            stHold.pendingPayloads.push({ ctxPayload: mergedCtx, storePath, executeDispatch, runEpoch: stHold.latestEpoch } as any);
+                                            if (stHold.timer) clearTimeout(stHold.timer);
+                                            stHold.timer = setTimeout(() => { stHold.timer = null; void drainSessionQueue(route.sessionKey, config, () => { }); }, 0);
+                                        }, 180000);
+                                    } else {
+                                        console.warn(`[QQ] requeue budget exhausted after ${Math.round(elapsedMs / 60000)}min for sess=${route.sessionKey}; dropping silently`);
+                                        if (config.enableQueueNotify !== false) {
+                                            const lostText = "⚠️ 上一轮收尾超时，这条消息最终没能自动补上。";
+                                            if (isGroup) client.sendGroupMsg(groupId, `${groupAt()}${lostText}`);
+                                            else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, lostText);
+                                            else client.sendPrivateMsg(userId, lostText);
+                                        }
+                                    }
                                 }
                             }
                         }
