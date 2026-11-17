@@ -5591,6 +5591,22 @@ ${current}
                                                 Number(dispatchCounts.block || 0) > 0 ||
                                                 Number(dispatchCounts.final || 0) > 0
                                             );
+                                            // 10.6 abort-settle can ACCEPT the inbound dispatch and
+                                            // return clean-but-empty (no error, no counts, no final):
+                                            // the message reached nowhere. Previously this fell into
+                                            // the !shouldFallback break and vanished silently (dad,
+                                            // Oct 31: 3-5s apart messages aborted with no trace in
+                                            // the session). Route these to the long-tail requeue.
+                                            const swallowedInbound = !text.trim().startsWith("/")
+                                                && !deliveredAnything && !sawReplyContent && !sawDispatcherOutput
+                                                && Number(dispatchCounts.final || 0) === 0
+                                                && Number(dispatchCounts.block || 0) === 0
+                                                && Number(dispatchCounts.tool || 0) === 0;
+                                            if (swallowedInbound) {
+                                                admissionSkipped = true;
+                                                console.warn(`[QQ] zero-output clean dispatch (inbound likely swallowed during abort-settle admission, dur ${Math.round(dispatchDurationMs)}ms); routing to long-tail requeue`);
+                                                break out_loop;
+                                            }
                                             if (deliveredAnything || sawReplyContent || sawDispatcherOutput || !shouldFallback) {
                                                 break out_loop;
                                             }
