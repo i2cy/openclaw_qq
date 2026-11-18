@@ -50,6 +50,9 @@ type GroupState = {
     debounceTimer: ReturnType<typeof setTimeout> | null;
     pendingTriggerSeq: number | null;
     queuedDuringReply: number[];   // REPLYING 期间到达的合格消息 seq
+    normalTurnActive: boolean;     // 正常路径(@/关键词)回合进行中:期间不判不注入
+    normalSince: number;           // 看门狗:正常回合 finally 缺失自愈
+    lastNormalReplyAt: number;     // 正常回合成功回复时刻(post-reply 宽限期)
     evalsThisHour: number;
     hourStamp: number;
     lastEvalAt: number;
@@ -232,7 +235,7 @@ function getState(groupKey: string): GroupState {
     if (!st) {
         st = {
             phase: "idle", debounceTimer: null, pendingTriggerSeq: null,
-            queuedDuringReply: [], evalsThisHour: 0, hourStamp: 0,
+            queuedDuringReply: [], normalTurnActive: false, normalSince: 0, lastNormalReplyAt: 0, evalsThisHour: 0, hourStamp: 0,
             lastEvalAt: 0, lastReplyAt: 0, replyingSince: 0,
         };
         states.set(groupKey, st);
@@ -435,6 +438,8 @@ export function onNormalDispatch(accountId: string, groupId: string) {
     for (const e of wf.entries) if (!e.injected) { e.injected = true; changed = true; }
     if (changed) persistWindow(key);
     const st = getState(key);
+    st.normalTurnActive = true;
+    st.normalSince = nowMs();
     if (st.phase === "debounce") {
         if (st.debounceTimer) clearTimeout(st.debounceTimer);
         st.debounceTimer = null; st.pendingTriggerSeq = null; st.phase = "idle";
@@ -479,10 +484,23 @@ export function considerTrigger(accountId: string, groupId: string, entry: Adapt
             return;
         }
     }
+    if (st.normalTurnActive) {
+        if (st.normalSince && nowMs() - st.normalSince > REPLYING_WATCHDOG_MS) {
+            st.normalTurnActive = false;
+        } else {
+            st.queuedDuringReply.push(entry.seq);
+            traceLog(accountId, `group=${groupId} seq=${entry.seq} queued during NORMAL turn (no double-take)`);
+            return;
+        }
+    }
     if (st.phase === "judging") return; // 判定中:窗口已记录,判定结果自然覆盖
     if (st.phase === "debounce") { st.pendingTriggerSeq = entry.seq; return; }
     // idle
     const now = nowMs();
+    if (st.lastNormalReplyAt && now - st.lastNormalReplyAt < cfg.replyCooldownMs) {
+        traceLog(accountId, `group=${groupId} seq=${entry.seq} skipped: normal reply just landed (${Math.round((now - st.lastNormalReplyAt) / 1000)}s ago)`);
+        return;
+    }
     if (now - st.lastEvalAt < cfg.cooldownMs) {
         traceLog(accountId, `group=${groupId} seq=${entry.seq} skipped: cooldown ${Math.round((cfg.cooldownMs - (now - st.lastEvalAt)) / 1000)}s left`);
         return;
@@ -500,6 +518,12 @@ export function considerTrigger(accountId: string, groupId: string, entry: Adapt
         const triggerSeq = st.pendingTriggerSeq;
         st.pendingTriggerSeq = null;
         if (triggerSeq == null) { st.phase = "idle"; return; }
+        if (st.normalTurnActive) {
+            st.phase = "idle";
+            st.queuedDuringReply.push(triggerSeq);
+            traceLog(accountId, `group=${groupId} eval fired but normal turn in progress; trigger requeued`);
+            return;
+        }
         void evaluate(accountId, String(groupId), triggerSeq);
     }, cfg.debounceMs);
     traceLog(accountId, `group=${groupId} seq=${entry.seq} eval scheduled in ${cfg.debounceMs}ms`);
@@ -510,7 +534,17 @@ export function onTurnComplete(accountId: string, groupId: string, info: { deliv
     if (!isAdaptiveGroup(accountId, groupId)) return;
     const key = gkey(accountId, String(groupId));
     const st = getState(key);
-    if (st.phase !== "replying") return;
+    const wasOwnTurn = st.phase === "replying";
+    st.normalTurnActive = false;
+    if (info.delivered && !info.synthetic) st.lastNormalReplyAt = nowMs();
+    if (!wasOwnTurn) {
+        // 正常回合结束:期间被暂缓的评估按冷却重排(大概率已 injected → 自然静默)
+        if (st.debounceTimer) clearTimeout(st.debounceTimer);
+        st.debounceTimer = null;
+        if (st.pendingTriggerSeq != null) { st.queuedDuringReply.push(st.pendingTriggerSeq); st.pendingTriggerSeq = null; }
+        if (st.phase === "debounce") st.phase = "idle";
+    }
+    if (!wasOwnTurn && st.queuedDuringReply.length === 0) return;
     st.phase = "idle";
     st.replyingSince = 0;
     const now = nowMs();
@@ -977,6 +1011,12 @@ async function evaluate(accountId: string, groupId: string, triggerSeq: number) 
     if (compactionNow != null) wf.lastFramedCompaction = compactionNow;
     persistWindow(key);
 
+    if (st.normalTurnActive) {
+        st.phase = "idle";
+        for (const e of selected) st.queuedDuringReply.push(e.seq);
+        traceLog(accountId, `group=${groupId} inject deferred: normal turn in progress (verdict was ${"REPLY"})`);
+        return;
+    }
     const syntheticId = `adaptive-${nowMs()}-${Math.floor(Math.random() * 1e4)}`;
     const markerText = `[主动插嘴 #${trigger.seq}]`;
     const event: OneBotEvent = {
