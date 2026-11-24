@@ -1422,6 +1422,133 @@ function collectForwardIdsFromCandidates(...messages: Array<OneBotMessage | stri
     return Array.from(unique);
 }
 
+// ── OneBot `json` segment (QQ mini-program / share card) summarizing ──────────
+// These cards used to render as a bare " [卡片]" placeholder, hiding the only
+// human-readable text the card carries (prompt / title / desc). These helpers run
+// on the inbound path for EVERY message, so they never throw and never emit raw
+// JSON — worst case they degrade to the legacy " [卡片]".
+const CARD_SUMMARY_MAX_CHARS = 60;
+// Keys that never hold display text (links, digests, ids, version strings...).
+const CARD_JUNK_KEY_RE = /(url|uri|md5|sha1|sha256|token|secret|icon|pic|image|img|avatar|path|app$|appid|appkey|bundleid|package|packet|signature|ver$|version|id$|_id$|time|stamp|size|width|height|type$|flag$|style|category|preview|source|platform|uin|qq$)/i;
+const CARD_TEXTISH_KEY_RE = /(title|desc|brief|text|content|summary|prompt|note|msg|message|name|subject|topic|intro|describe)/i;
+
+function normalizeCardText(raw: string): string {
+    // strip control chars / zero-width noise, collapse all whitespace onto one line
+    return raw
+        .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, "")
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function capCardText(text: string): string {
+    const chars = Array.from(text);
+    if (chars.length <= CARD_SUMMARY_MAX_CHARS) return text;
+    return `${chars.slice(0, CARD_SUMMARY_MAX_CHARS).join("")}…`;
+}
+
+function isPlausibleCardText(value: string): boolean {
+    const text = normalizeCardText(value);
+    if (!text) return false;
+    if (text.length > 512) return false; // blobs are not display strings
+    if (/^[\s\-+.,:%\d]+$/.test(text)) return false; // pure numbers / punctuation
+    if (/^[{[]/.test(text)) return false; // raw JSON, never useful as-is
+    const withoutUrls = text.replace(/(?:https?|ftp|qq|weixin|mailto):\/\/\S+/gi, "").replace(/\s+/g, " ").trim();
+    if (!withoutUrls) return false; // URL-only value
+    if (/^data:[^,]*,?$/.test(withoutUrls)) return false;
+    return true;
+}
+
+function parseCardJsonOnce(raw: unknown): unknown {
+    if (typeof raw !== "string") return raw;
+    const text = raw.trim();
+    if (!text || !/^[{[]/.test(text)) return undefined;
+    try {
+        return JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+}
+
+function cardCandidateTier(key: string): number {
+    const k = key.toLowerCase();
+    if (k === "prompt") return 0;
+    if (k === "summary") return 1;
+    if (k === "title" || k === "titletext" || k === "title_text") return 2;
+    if (k === "desc" || k === "brief" || k === "desct" || k === "describe" || k === "description") return 3;
+    if (CARD_JUNK_KEY_RE.test(k)) return 90;
+    if (CARD_TEXTISH_KEY_RE.test(k)) return 4;
+    return 5;
+}
+
+function collectCardStrings(
+    node: unknown,
+    depth: number,
+    nestedParsed: boolean,
+    visited: Set<unknown>,
+    found: Array<{ tier: number; depth: number; order: number; text: string }>,
+    counter: { n: number },
+): void {
+    if (depth > 4 || node === null || node === undefined) return;
+    if (typeof node === "string") {
+        // exactly one second-level parse: a field that is itself a JSON string
+        if (!nestedParsed && /^[{[]/.test(node.trim())) {
+            const decoded = parseCardJsonOnce(node);
+            if (decoded && typeof decoded === "object") {
+                collectCardStrings(decoded, depth + 1, true, visited, found, counter);
+            }
+        }
+        return;
+    }
+    if (typeof node !== "object") return;
+    if (visited.has(node)) return; // cycle guard
+    visited.add(node);
+    if (Array.isArray(node)) {
+        for (const item of node) collectCardStrings(item, depth + 1, nestedParsed, visited, found, counter);
+        return;
+    }
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+        if (typeof value === "string") {
+            const text = normalizeCardText(value);
+            const tier = cardCandidateTier(key);
+            if (text && tier < 90 && isPlausibleCardText(value)) {
+                found.push({ tier, depth, order: counter.n++, text });
+            }
+            if (!nestedParsed && /^[{[]/.test(value.trim())) {
+                const decoded = parseCardJsonOnce(value);
+                if (decoded && typeof decoded === "object") {
+                    collectCardStrings(decoded, depth + 1, true, visited, found, counter);
+                }
+            }
+            continue;
+        }
+        collectCardStrings(value, depth + 1, nestedParsed, visited, found, counter);
+    }
+}
+
+function cardSummaryFromJsonSegment(seg: { data?: Record<string, unknown> } | undefined): string {
+    const data = seg?.data;
+    if (!data || typeof data !== "object") return "";
+    // the payload lives in data.content (sometimes data.data); fall back to data itself
+    let decoded = parseCardJsonOnce(data.content ?? data.data) as unknown;
+    if (!decoded || typeof decoded !== "object") decoded = data;
+    const found: Array<{ tier: number; depth: number; order: number; text: string }> = [];
+    collectCardStrings(decoded, 0, false, new Set<unknown>(), found, { n: 0 });
+    if (!found.length) return "";
+    found.sort((a, b) => (a.tier - b.tier) || (a.depth - b.depth) || (a.order - b.order));
+    return capCardText(found[0].text);
+}
+
+/** Render a OneBot `json` segment as " [卡片:<summary>]", or legacy " [卡片]" when nothing usable. Never throws. */
+export function summarizeOneBotJsonCardSegment(seg: { data?: Record<string, unknown> } | undefined): string {
+    try {
+        const summary = cardSummaryFromJsonSegment(seg);
+        return summary ? ` [卡片:${summary}]` : " [卡片]";
+    } catch {
+        return " [卡片]";
+    }
+}
+
 function summarizeOneBotSegments(message: OneBotMessage | string | undefined, maxChars: number): LayerSegmentContext {
     const images = extractImageUrls(message, 5);
     const files: Array<{ name: string; url?: string; fileId?: string; busid?: string; size?: number }> = [];
@@ -1435,7 +1562,7 @@ function summarizeOneBotSegments(message: OneBotMessage | string | undefined, ma
             else if (seg.type === "record") text += ` [语音${seg.data?.text ? `:${seg.data.text}` : ""}]`;
             else if (seg.type === "image") text += " [图片]";
             else if (seg.type === "video") text += seg.data?.url ? ` [视频:${seg.data.url}]` : " [视频]";
-            else if (seg.type === "json") text += " [卡片]";
+            else if (seg.type === "json") text += summarizeOneBotJsonCardSegment(seg);
             else if (seg.type === "file") {
                 const fileName = seg.data?.name || seg.data?.file || "未命名";
                 text += ` [文件:${fileName}]`;
